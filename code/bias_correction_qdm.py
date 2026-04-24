@@ -62,7 +62,7 @@ def load_era5(era5_dir: Path, vname: str, units: str, train: slice) -> xr.Datase
     """Load ERA5, strip GRIB scalar coords, convert to noleap, drop leap-day NaN."""
     path = era5_dir / f"era5_{vname}_1980_2020.nc"
     ds = (
-        xr.open_dataset(path)
+        xr.open_dataset(path, chunks={"time": 365})
         .sel(time=train)
         .sortby("lat").sortby("lon")
     )
@@ -219,6 +219,7 @@ def main():
         )
         era5_rg = regridder(era5_ds)[vname]
         era5_rg.attrs["units"] = unit
+        era5_rg = era5_rg.dropna(dim='time', how='all')
         # override lat/lon to exact GCM float values (avoids tiny FP mismatches)
         era5_rg = era5_rg.assign_coords(lat=ref_lat, lon=ref_lon)
         del era5_ds, target_grid, regridder
@@ -245,8 +246,43 @@ def main():
             kind=kind,
             group="time.month",
         )
-        del ref_v, hist_v, era5_rg, hist_da
         log.info("  QDM trained")
+
+        # 6b. Save historical alignment files (era5_ref + gcm_historical_bc)
+        out_era5_ref  = args.out_dir / f"{vname}_era5_ref.nc"
+        out_hist_bc   = args.out_dir / f"{vname}_{args.gcm}_historical_bc.nc"
+        if not out_hist_bc.exists():
+            # apply QDM to the historical period to check alignment with ERA5
+            bc_hist = QM.adjust(hist_v, interp="linear", extrapolation="constant")
+            if use_log:
+                bc_hist = sdba_proc.from_additive_space(bc_hist)
+                bc_hist.values[bc_hist.values < 1e-5] = 0.0
+
+            # ERA5 regridded reference
+            ds_ref = era5_rg.to_dataset(name=vname)
+            ds_ref[vname].attrs["units"] = unit
+            ds_ref.attrs = {
+                "description": f"ERA5 regridded to {args.gcm} grid — {vname}",
+                "gcm": args.gcm,
+            }
+            ds_ref.to_netcdf(out_era5_ref)
+            log.info("  → %s", out_era5_ref.name)
+
+            # bias-corrected historical GCM
+            ds_hbc = bc_hist.to_dataset(name=vname)
+            ds_hbc[vname].attrs["units"] = unit
+            ds_hbc.attrs = {
+                "description": (f"QDM bias-corrected {vname} historical — "
+                                f"{args.gcm} {args.run}"),
+                "method": "Quantile Delta Mapping (Cannon et al. 2015) via xclim.sdba",
+                "reference": f"ERA5 daily {args.train_start} – {args.train_end}",
+                "gcm": args.gcm, "run": args.run, "ssp": "historical",
+            }
+            ds_hbc.to_netcdf(out_hist_bc)
+            log.info("  → %s", out_hist_bc.name)
+            del bc_hist, ds_ref, ds_hbc
+
+        del ref_v, hist_v, era5_rg, hist_da
 
         # 7. Apply to each SSP scenario
         for ssp in args.ssps:
