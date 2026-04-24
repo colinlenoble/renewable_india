@@ -1,0 +1,4 @@
+18:01:27 [INFO] ESMFMKFILE = /gpfs/workdir/shared/juicce/envs/xenv/lib/esmf.mk  (exists: True)
+18:01:30 [INFO] ━━━ tas ━━━
+18:01:30 [INFO]   Loading ERA5 tas …
+[2026-04-23T20:54:45.137] error: *** JOB 817506 ON ruche-mem03 CANCELLED AT 2026-04-23T20:54:45 DUE to SIGNAL Terminated ***

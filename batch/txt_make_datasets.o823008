@@ -1,0 +1,14 @@
+19:57:53 [INFO] ESMFMKFILE = /gpfs/workdir/shared/juicce/envs/xenv/lib/esmf.mk  (exists: True)
+19:57:54 [INFO] ━━━ tas ━━━
+19:57:54 [INFO]   Loading ERA5 tas …
+/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/../code/bias_correction_qdm.py:65: UserWarning: The specified chunks separate the stored chunks along dimension "time" starting at index 365. This could degrade performance. Instead, consider rechunking after loading.
+  xr.open_dataset(path, chunks={"time":365})
+loaded
+Traceback (most recent call last):
+  File "/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/../code/bias_correction_qdm.py", line 303, in <module>
+    main()
+  File "/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/../code/bias_correction_qdm.py", line 190, in main
+    era5_ds = load_era5(args.era5_dir, vname, unit, TRAIN)
+  File "/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/../code/bias_correction_qdm.py", line 70, in load_era5
+    ds = ds.drop_vars(
+AttributeError: 'tuple' object has no attribute 'drop_vars'
