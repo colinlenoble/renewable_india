@@ -1,0 +1,33 @@
+17:35:30 [INFO] ESMFMKFILE = /gpfs/workdir/shared/juicce/envs/xenv/lib/esmf.mk  (exists: True)
+17:35:53 [INFO] Found 1 NetCDF file(s)
+17:36:05 [INFO] GCM grid: 11 lat × 10 lon
+17:36:05 [INFO] === Pass 1: build feature matrix ===
+17:36:05 [INFO]   Loading era5_india_2025_hourly.nc …
+17:36:05 [INFO]   Regridder built
+17:36:19 [INFO] Total ERA5 days: 365
+17:36:43 [INFO] Feature matrix: (40150, 3)
+17:36:43 [INFO] === Fitting MiniBatchKMeans (k=30) ===
+17:36:45 [INFO] Inertia: 1.572e+04
+17:36:45 [INFO] === Computing circular-mean DOY per cluster ===
+17:36:45 [INFO] Cluster DOY range: 4.4 – 364.1
+17:36:45 [INFO] === Pass 2: accumulate per-cluster profiles ===
+17:36:45 [INFO]   Profiles from era5_india_2025_hourly.nc …
+17:37:10 [INFO] === Saving library ===
+17:37:10 [INFO] Library saved → ../data/proc/era5/diurnal_library_CanESM5.nc
+17:38:13 [INFO] Loading library …
+17:38:36 [INFO] Library: 30 clusters, grid 11 lat × 10 lon
+17:38:36 [INFO] Calendar window: ±30 days
+17:38:36 [INFO] === CanESM5 historical ===
+17:38:40 [INFO] BC days loaded: 11315
+Traceback (most recent call last):
+  File "/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/../code/downscale_hourly.py", line 636, in <module>
+    cmd_apply(args)
+  File "/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/../code/downscale_hourly.py", line 632, in main
+    args = parse_args()
+  File "/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/../code/downscale_hourly.py", line 473, in cmd_apply
+    # ── Reuse the aligned arrays in reconstruction ────────────────────────────────
+ValueError: operands could not be broadcast together with shapes (10,11315,11,3) (1,11,10,3) 
+Traceback (most recent call last):
+  File "/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/../code/compute_cf.py", line 74, in <module>
+    import regionmask
+ModuleNotFoundError: No module named 'regionmask'

@@ -1,0 +1,30 @@
+16:29:45 [INFO] ESMFMKFILE = /gpfs/workdir/shared/juicce/envs/xenv/lib/esmf.mk  (exists: True)
+16:30:20 [INFO] Found 1 NetCDF file(s)
+16:30:32 [INFO] GCM grid: 11 lat × 10 lon
+16:30:32 [INFO] === Pass 1: build feature matrix ===
+16:30:32 [INFO]   Loading era5_india_2025_hourly.nc …
+16:30:33 [INFO]   Regridder built
+16:30:46 [INFO] Total ERA5 days: 365
+16:31:15 [INFO] Feature matrix: (40150, 3)
+16:31:15 [INFO] === Fitting MiniBatchKMeans (k=30) ===
+16:31:17 [INFO] Inertia: 1.572e+04
+16:31:17 [INFO] === Computing circular-mean DOY per cluster ===
+16:31:17 [INFO] Cluster DOY range: 4.4 – 364.1
+16:31:17 [INFO] === Pass 2: accumulate per-cluster profiles ===
+16:31:17 [INFO]   Profiles from era5_india_2025_hourly.nc …
+16:31:46 [INFO] === Saving library ===
+16:31:46 [INFO] Library saved → ../data/proc/era5/diurnal_library_CanESM5.nc
+16:32:59 [INFO] Loading library …
+16:33:21 [INFO] Library: 30 clusters, grid 11 lat × 10 lon
+16:33:21 [INFO] Calendar window: ±30 days
+16:33:21 [INFO] === CanESM5 historical ===
+16:33:26 [INFO] BC days loaded: 11315
+Traceback (most recent call last):
+  File "/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/../code/downscale_hourly.py", line 636, in <module>
+    main()
+  File "/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/../code/downscale_hourly.py", line 632, in main
+    cmd_apply(args)
+  File "/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/../code/downscale_hourly.py", line 473, in cmd_apply
+    X_norm = (X_gcm - feat_mean[np.newaxis]) / feat_std[np.newaxis]
+ValueError: operands could not be broadcast together with shapes (10,11315,11,3) (1,11,10,3) 
+python: can't open file '/gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/batch/compute_cf.py': [Errno 2] No such file or directory
