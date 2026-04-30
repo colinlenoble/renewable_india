@@ -5,30 +5,44 @@ Hourly temporal downscaling of bias-corrected GCM daily data.
 Two-phase pipeline
 ------------------
 fit
-    Regrid ERA5 hourly (GRIB) to GCM grid with xesmf bilinear.
+    Regrid ERA5 hourly NetCDF files to GCM grid with xesmf bilinear.
     Fit MiniBatchKMeans on normalised daily (rsds, tas, sfcWind) features.
     Compute per-cluster diurnal profiles per grid cell:
         rsds    → fraction of daily total   (sums to 1)
         tas     → anomaly from daily mean   (mean  0)
         sfcWind → ratio to daily mean       (mean  1)
-    Save centroid matrix, normalisation stats and profiles as library NetCDF.
+    Also store the circular-mean day-of-year of each cluster for calendar
+    filtering.  Save centroid matrix, normalisation stats, cluster DOYs and
+    profiles as library NetCDF.
 
 apply
     Load library + BC-corrected GCM daily files.
     For each (day, cell) normalise daily values → find nearest centroid
-    → reconstruct 24 hourly values using the cell's cluster profile.
+    **within a ±doy-window calendar window** → reconstruct 24 hourly values
+    using the cell's cluster profile.
     Write hourly NetCDF files ready for CF computation.
 
-ssrd de-accumulation
-    ERA5 ssrd is accumulated since the previous midnight UTC (J m-2).
-    Hourly-mean irradiance (W m-2) = diff(ssrd, prepend=0) / 3600,
-    clipped to ≥ 0 to remove floating-point negatives at midnight.
+Calendar window rationale
+    Restricting centroid search to clusters whose median DOY is within ±N
+    days of the target day prevents a January day from inheriting a July
+    diurnal profile even when their daily rsds/tas/wind values are similar
+    (common in tropical regions or for low-seasonality variables such as
+    wind).  Distance is computed circularly so the window wraps correctly
+    around 1 Jan / 31 Dec.
+
+ERA5 NetCDF input
+    Run convert_era5_hourly.py first to convert raw GRIB files to NetCDF
+    containing {tas (K), rsds (W m-2), sfcWind (m s-1)}, zlib-compressed.
 
 Usage
 -----
+# 0 – Convert GRIB → NetCDF (run once per year file):
+python convert_era5_hourly.py /data/raw/era5/era5_india_*.grib \\
+    --out-dir /data/proc/era5
+
 # 1 – Fit (once per GCM grid):
 python downscale_hourly.py fit \\
-    --era5-grib  /data/raw/era5/era5_india_*.grib \\
+    --era5-nc    "/data/raw/era5/era5_india_*.nc" \\
     --gcm-grid   /data/proc/cmip6_bc/tas_CanESM5_historical_bc.nc \\
     --out-library /data/proc/era5/diurnal_library_CanESM5.nc \\
     --n-clusters  30 \\
@@ -40,7 +54,8 @@ python downscale_hourly.py apply \\
     --bc-dir   /data/proc/cmip6_bc \\
     --gcm      CanESM5 --run r10i1p1f1 \\
     --ssps     ssp245 ssp585 \\
-    --out-dir  /data/proc/cmip6_hourly
+    --out-dir  /data/proc/cmip6_hourly \\
+    --doy-window 30
 """
 
 import os
@@ -62,70 +77,22 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── GRIB short-name → internal variable name ─────────────────────────────────
-GRIB_VARS = {
-    "t2m":  "tas",
-    "ssrd": "rsds",
-    "u10":  "u10",
-    "v10":  "v10",
-}
+# ── ERA5 NetCDF loader ────────────────────────────────────────────────────────
 
-
-# ── ERA5 GRIB loader ─────────────────────────────────────────────────────────
-
-def load_era5_hourly_grib(grib_path: Path) -> xr.Dataset:
+def load_era5_hourly_nc(nc_path: Path) -> xr.Dataset:
     """
-    Load one year of ERA5 hourly GRIB.
-    Returns Dataset with vars tas (K), rsds (W m-2), u10/v10 (m s-1),
-    dims (time, latitude, longitude), time = 24 h * n_days.
-    ssrd is de-accumulated and converted from J m-2 to W m-2.
+    Load one ERA5 hourly NetCDF produced by convert_era5_hourly.py.
+    Expected variables: tas (K), rsds (W m-2), sfcWind (m s-1).
     """
-    import cfgrib
-
-    parts = {}
-    for short in ["t2m", "ssrd", "u10", "v10"]:
-        ds = cfgrib.open_dataset(
-            str(grib_path),
-            backend_kwargs={"filter_by_keys": {"shortName": short}},
-            indexpath=None,
-        )
-        # standardise coord names to lowercase lat/lon
-        rename = {}
-        if "latitude" in ds.coords:
-            rename["latitude"] = "lat"
-        if "longitude" in ds.coords:
-            rename["longitude"] = "lon"
-        if rename:
-            ds = ds.rename(rename)
-        parts[short] = ds[short]
-
-    # de-accumulate ssrd (J m-2 → W m-2) per day
-    ssrd_raw = parts["ssrd"]
-    # group by date so diff resets at each midnight
-    dates = pd.DatetimeIndex(ssrd_raw.time.values).normalize()
-    unique_dates = pd.DatetimeIndex(sorted(set(dates)))
-    deacc_list = []
-    for d in unique_dates:
-        mask = dates == d
-        day_acc = ssrd_raw.isel(time=mask)
-        vals = day_acc.values          # (24, lat, lon)
-        hourly = np.diff(vals, axis=0, prepend=0)
-        hourly = np.maximum(hourly, 0) / 3600   # W m-2
-        deacc_list.append(
-            xr.DataArray(hourly, coords=day_acc.coords, dims=day_acc.dims)
-        )
-    ssrd_da = xr.concat(deacc_list, dim="time")
-
-    ds_out = xr.Dataset({
-        "tas":  parts["t2m"],
-        "rsds": ssrd_da,
-        "u10":  parts["u10"],
-        "v10":  parts["v10"],
-    })
-    ds_out["sfcWind"] = np.hypot(ds_out["u10"], ds_out["v10"])
-    ds_out = ds_out.drop_vars(["u10", "v10"])
-    ds_out = ds_out.sortby("lat").sortby("lon")
-    return ds_out
+    ds = xr.open_dataset(nc_path, chunks={"time": 24})
+    rn = {}
+    if "latitude" in ds.coords:
+        rn["latitude"] = "lat"
+    if "longitude" in ds.coords:
+        rn["longitude"] = "lon"
+    if rn:
+        ds = ds.rename(rn)
+    return ds.sortby("lat").sortby("lon")
 
 
 # ── xesmf regridder factory ───────────────────────────────────────────────────
@@ -194,6 +161,22 @@ def hourly_profiles(ds_h: xr.Dataset, ds_d: xr.Dataset):
     return frac, anom, ratio
 
 
+# ── Calendar-window cluster filter ───────────────────────────────────────────
+
+def get_valid_clusters(doy: int, cluster_doys: np.ndarray, window: int) -> np.ndarray:
+    """
+    Return indices of clusters whose circular-mean DOY falls within ±window
+    days of the target DOY.  Distance wraps correctly around 1 Jan / 31 Dec.
+    Falls back to all clusters if none qualify (should not happen for window ≥ 15).
+    """
+    diff = np.abs(((cluster_doys - doy + 182) % 365) - 182)
+    valid = np.where(diff <= window)[0]
+    if len(valid) == 0:
+        log.warning("DOY %d: no cluster within window=%d — using all clusters", doy, window)
+        valid = np.arange(len(cluster_doys))
+    return valid
+
+
 # ── Feature matrix builder ───────────────────────────────────────────────────
 
 def build_features(ds_d: xr.Dataset, stats: dict | None = None):
@@ -234,10 +217,10 @@ def cmd_fit(args):
     log.info("ESMFMKFILE = %s  (exists: %s)", mk, mk.exists())
     import xesmf as xe
 
-    grib_files = sorted(glob.glob(args.era5_grib))
-    if not grib_files:
-        raise FileNotFoundError(f"No GRIB files matched: {args.era5_grib}")
-    log.info("Found %d GRIB file(s)", len(grib_files))
+    nc_files = sorted(glob.glob(args.era5_nc))
+    if not nc_files:
+        raise FileNotFoundError(f"No NetCDF files matched: {args.era5_nc}")
+    log.info("Found %d NetCDF file(s)", len(nc_files))
 
     # Load target grid from one BC file (drop time so it becomes a 2-D template)
     gcm_grid_ds = xr.open_dataset(args.gcm_grid).isel(time=0).drop_vars("time", errors="ignore")
@@ -252,11 +235,10 @@ def cmd_fit(args):
     log.info("=== Pass 1: build feature matrix ===")
     regridder = None
     all_daily_list = []
-    era5_stats = None   # computed from first file, reused
 
-    for grib_path in grib_files:
-        log.info("  Loading %s …", Path(grib_path).name)
-        ds_h_era5 = load_era5_hourly_grib(Path(grib_path))
+    for nc_path in nc_files:
+        log.info("  Loading %s …", Path(nc_path).name)
+        ds_h_era5 = load_era5_hourly_nc(Path(nc_path))
 
         if regridder is None:
             src_grid = ds_h_era5.isel(time=0).drop_vars("time", errors="ignore")
@@ -291,19 +273,39 @@ def cmd_fit(args):
     log.info("Inertia: %.3e", kmeans.inertia_)
     del X_flat
 
+    # ── Compute circular-mean DOY per cluster ─────────────────────────────────
+    log.info("=== Computing circular-mean DOY per cluster ===")
+    K = args.n_clusters
+    times_all = pd.DatetimeIndex(ds_all_daily.time.values)
+    doys_all  = np.array([t.dayofyear for t in times_all])   # (n_days,)
+    # repeat each DOY for every grid cell so it aligns with labels_flat
+    doys_flat = np.repeat(doys_all, n_lat * n_lon)            # (n_days*lat*lon,)
+
+    cluster_doys = np.zeros(K, dtype=np.float64)
+    for k in range(K):
+        mask_k = labels_flat == k
+        if mask_k.any():
+            angles = doys_flat[mask_k] * (2 * np.pi / 365)
+            circular_mean = (
+                np.degrees(np.arctan2(np.sin(angles).mean(), np.cos(angles).mean())) % 360
+            ) * 365 / 360
+            cluster_doys[k] = max(1.0, circular_mean)
+        else:
+            cluster_doys[k] = 183.0   # fallback: mid-year
+    log.info("Cluster DOY range: %.1f – %.1f", cluster_doys.min(), cluster_doys.max())
+
     # ── Pass 2: compute per-cluster per-cell profiles ─────────────────────────
     log.info("=== Pass 2: accumulate per-cluster profiles ===")
     # accumulators: (n_clusters, 24, n_lat, n_lon)
-    K = args.n_clusters
     sum_frac  = np.zeros((K, 24, n_lat, n_lon), dtype=np.float64)
     sum_anom  = np.zeros((K, 24, n_lat, n_lon), dtype=np.float64)
     sum_ratio = np.zeros((K, 24, n_lat, n_lon), dtype=np.float64)
     count_k   = np.zeros((K, n_lat, n_lon), dtype=np.float64)
 
     day_offset = 0
-    for grib_path in grib_files:
-        log.info("  Profiles from %s …", Path(grib_path).name)
-        ds_h_era5 = load_era5_hourly_grib(Path(grib_path))
+    for nc_path in nc_files:
+        log.info("  Profiles from %s …", Path(nc_path).name)
+        ds_h_era5 = load_era5_hourly_nc(Path(nc_path))
         ds_h_rg   = regridder(ds_h_era5)
         ds_h_rg   = ds_h_rg.assign_coords(lat=lat_gcm, lon=lon_gcm)
         ds_d_year = hourly_to_daily(ds_h_rg)
@@ -348,6 +350,12 @@ def cmd_fit(args):
             dims=["cluster", "feature"],
             attrs={"features": "rsds, tas, sfcWind (normalised)"},
         ),
+        # circular-mean DOY per cluster (used for calendar-window filtering)
+        "cluster_doy": xr.DataArray(
+            cluster_doys,
+            dims=["cluster"],
+            attrs={"description": "Circular-mean day-of-year of ERA5 days assigned to cluster"},
+        ),
         # per-cell normalisation stats
         "feat_mean": xr.DataArray(era5_stats["mean"], dims=["lat", "lon", "feature"]),
         "feat_std":  xr.DataArray(era5_stats["std"],  dims=["lat", "lon", "feature"]),
@@ -362,7 +370,7 @@ def cmd_fit(args):
         "description": "ERA5 diurnal downscaling library (K-means cluster profiles)",
         "n_clusters":  K,
         "gcm_grid":    args.gcm_grid,
-        "era5_grib":   args.era5_grib,
+        "era5_nc":     args.era5_nc,
     }
     Path(args.out_library).parent.mkdir(parents=True, exist_ok=True)
     ds_lib.to_netcdf(args.out_library)
@@ -376,16 +384,18 @@ def cmd_fit(args):
 def cmd_apply(args):
     log.info("Loading library …")
     lib = xr.open_dataset(args.library)
-    centroids   = lib["centroids"].values         # (K, 3)
-    feat_mean   = lib["feat_mean"].values         # (lat, lon, 3)
-    feat_std    = lib["feat_std"].values          # (lat, lon, 3)
-    prof_frac   = lib["prof_frac"].values         # (K, 24, lat, lon)
-    prof_anom   = lib["prof_anom"].values         # (K, 24, lat, lon)
-    prof_ratio  = lib["prof_ratio"].values        # (K, 24, lat, lon)
+    centroids    = lib["centroids"].values        # (K, 3)
+    feat_mean    = lib["feat_mean"].values        # (lat, lon, 3)
+    feat_std     = lib["feat_std"].values         # (lat, lon, 3)
+    prof_frac    = lib["prof_frac"].values        # (K, 24, lat, lon)
+    prof_anom    = lib["prof_anom"].values        # (K, 24, lat, lon)
+    prof_ratio   = lib["prof_ratio"].values       # (K, 24, lat, lon)
+    cluster_doys = lib["cluster_doy"].values      # (K,)
     lat_gcm = lib["lat"].values
     lon_gcm = lib["lon"].values
     K = len(lib["cluster"])
     log.info("Library: %d clusters, grid %d×%d", K, len(lat_gcm), len(lon_gcm))
+    log.info("Calendar window: ±%d days", args.doy_window)
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -422,14 +432,20 @@ def cmd_apply(args):
         ], axis=-1)  # (n_days, lat, lon, 3)
 
         X_norm = (X_gcm - feat_mean[np.newaxis]) / feat_std[np.newaxis]
-        X_flat = X_norm.reshape(-1, 3)   # (n_days*lat*lon, 3)
 
-        # Nearest-centroid assignment (argmin squared distance)
-        log.info("Assigning clusters …")
-        diff = X_flat[:, np.newaxis, :] - centroids[np.newaxis, :, :]  # (N, K, 3)
-        dist2 = (diff ** 2).sum(axis=-1)   # (N, K)
-        labels_flat = dist2.argmin(axis=-1)
-        labels = labels_flat.reshape(n_days, n_lat, n_lon)
+        # Cluster assignment with calendar-window filter (per day)
+        log.info("Assigning clusters with DOY window ±%d …", args.doy_window)
+        labels = np.empty((n_days, n_lat, n_lon), dtype=np.int32)
+        for d in range(n_days):
+            doy   = times_d[d].dayofyear
+            valid = get_valid_clusters(doy, cluster_doys, args.doy_window)
+            x_day = X_norm[d].reshape(-1, 3)                              # (lat*lon, 3)
+            diff  = x_day[:, np.newaxis, :] - centroids[valid][np.newaxis]
+            dist2 = (diff ** 2).sum(axis=-1)                              # (lat*lon, |valid|)
+            labels[d] = valid[dist2.argmin(axis=-1)].reshape(n_lat, n_lon)
+            if d % 365 == 0:
+                log.info("  Day %d / %d  (DOY=%d, %d valid clusters)",
+                         d, n_days, doy, len(valid))
 
         # Reconstruct hourly values
         log.info("Reconstructing hourly arrays …")
@@ -504,14 +520,21 @@ def cmd_apply(args):
         })
         ds_out.attrs = {
             "description": (f"Hourly downscaled BC GCM data — {args.gcm} {args.run} {ssp}"),
-            "method":      "K-means diurnal profile downscaling from ERA5 hourly",
+            "method":      "K-means diurnal profile downscaling from ERA5 hourly "
+                           f"with calendar window ±{args.doy_window} days",
             "library":     str(args.library),
             "gcm":         args.gcm,
             "run":         args.run,
             "ssp":         ssp,
+            "doy_window":  args.doy_window,
         }
 
-        encoding = {v: {"zlib": True, "complevel": 4} for v in ds_out.data_vars}
+        n_lat_out, n_lon_out = len(lat_gcm), len(lon_gcm)
+        encoding = {
+            v: {"zlib": True, "complevel": 4,
+                "chunksizes": (24, n_lat_out, n_lon_out)}
+            for v in ds_out.data_vars
+        }
         ds_out.to_netcdf(out_path, encoding=encoding)
         log.info("→ %s", out_path.name)
         del rsds_d, tas_d, wind_d, rsds_hourly, tas_hourly, wind_hourly, ds_out
@@ -529,9 +552,10 @@ def parse_args():
 
     # ── fit ──────────────────────────────────────────────────────────────────
     fit = sub.add_parser("fit", help="Train K-means diurnal library from ERA5 hourly")
-    fit.add_argument("--era5-grib",    required=True,
-                     help="Glob pattern for ERA5 hourly GRIB files "
-                          "(e.g. '/data/raw/era5/era5_india_*.grib')")
+    fit.add_argument("--era5-nc",      required=True,
+                     help="Glob pattern for ERA5 hourly NetCDF files produced by "
+                          "convert_era5_hourly.py "
+                          "(e.g. '/data/raw/era5/era5_india_*.nc')")
     fit.add_argument("--gcm-grid",     required=True, type=Path,
                      help="Any BC output NetCDF (used only for lat/lon grid)")
     fit.add_argument("--out-library",  required=True,
@@ -550,8 +574,12 @@ def parse_args():
     app.add_argument("--gcm",       default="CanESM5")
     app.add_argument("--run",       default="r10i1p1f1")
     app.add_argument("--ssps",      nargs="+", default=["ssp245", "ssp585"])
-    app.add_argument("--out-dir",   required=True, type=Path,
+    app.add_argument("--out-dir",    required=True, type=Path,
                      help="Output directory for hourly NetCDF files")
+    app.add_argument("--doy-window", type=int, default=30,
+                     help="Calendar half-window in days for cluster selection (default: 30). "
+                          "Only clusters whose circular-mean DOY is within this range of the "
+                          "target day are considered.")
 
     return p.parse_args()
 
