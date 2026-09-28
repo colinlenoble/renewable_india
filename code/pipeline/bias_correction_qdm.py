@@ -113,15 +113,22 @@ def load_wind_cmip(cmip_dir: Path, gcm: str, scenario: str,
 def align_common_dates(da_a: xr.DataArray, da_b: xr.DataArray):
     """
     Return (da_a_aligned, da_b_aligned) sharing only common YYYY-MM-DD dates.
-    Works with both cftime and numpy datetime64.
+    Works with both cftime and numpy datetime64. Duplicate dates (e.g. from
+    overlapping merged files) are dropped, keeping the first occurrence.
     """
-    dates_a = pd.Index([str(t)[:10] for t in da_a.time.values])
-    dates_b = pd.Index([str(t)[:10] for t in da_b.time.values])
-    common = dates_a.intersection(dates_b)
-    idx_a = [i for i, t in enumerate(da_a.time.values) if str(t)[:10] in common]
-    idx_b = [i for i, t in enumerate(da_b.time.values) if str(t)[:10] in common]
-    da_a = da_a.isel(time=idx_a)
-    da_b = da_b.isel(time=idx_b)
+    def _dedup(da, label):
+        dates = pd.Index([str(t)[:10] for t in da.time.values])
+        dup = dates.duplicated()
+        if dup.any():
+            log.warning("  %s: %d duplicate dates dropped (e.g. %s)",
+                        label, dup.sum(), list(dates[dup][:3]))
+        return da.isel(time=np.flatnonzero(~dup)), dates[~dup]
+
+    da_a, dates_a = _dedup(da_a, "ref")
+    da_b, dates_b = _dedup(da_b, "hist")
+    common = dates_a.intersection(dates_b).sort_values()
+    da_a = da_a.isel(time=dates_a.get_indexer(common))
+    da_b = da_b.isel(time=dates_b.get_indexer(common))
     # assign da_b's time coords to da_a so xclim sees a single calendar
     da_a = da_a.assign_coords(time=da_b.time.values)
     return da_a, da_b, len(common)
