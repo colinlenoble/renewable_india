@@ -75,6 +75,7 @@ CONFIG = {
     "wind_method":     "shear_local",
     "buffer_km":       50,
     "skip_validation": False,     # daily BC validation plots in compute_cf
+    "overwrite":       True,      # recompute outputs that already exist (else skip them)
 }
 
 STEPS = ["bias_correction", "diurnal_fit", "diurnal_apply", "cf", "cf_states", "tas_states"]
@@ -99,6 +100,7 @@ def build_commands(c: dict, aggregate_only: bool = False
     py, gcm = sys.executable, c["gcm"]
     scenarios = ["historical", *c["ssps"]]
     cf_dir = _p("cf_root", c) / gcm
+    force = ["--force"] if c["overwrite"] else []
 
     # compute_cf.py: aggregation-only reads the existing CF files, not the hourly inputs
     cf_inputs = [_p("shapefile", c), _p("wind_tracker", c), _p("solar_tracker", c)]
@@ -117,6 +119,7 @@ def build_commands(c: dict, aggregate_only: bool = False
             "--ssps", *c["ssps"],
             "--train-start", c["train_start"], "--train-end", c["train_end"],
             "--nquantiles", str(c["nquantiles"]),
+            *force,
         ], [_p("era5_daily_dir", c), _p("cmip_dir", c)]),
 
         "diurnal_fit": ([
@@ -136,6 +139,7 @@ def build_commands(c: dict, aggregate_only: bool = False
             "--out-dir", str(_p("hourly_dir", c)),
             "--doy-window", str(c["doy_window"]),
             "--seed", str(c["seed"]),
+            *force,
         ], [_p("library", c)]),
 
         "cf": ([
@@ -156,7 +160,7 @@ def build_commands(c: dict, aggregate_only: bool = False
             "--wind-capacity-file", str(_p("wind_tracker", c)),
             "--solar-capacity-file", str(_p("solar_tracker", c)),
             *(["--skip-validation"] if c["skip_validation"] else []),
-            *(["--aggregate-only"] if aggregate_only else []),
+            *(["--aggregate-only"] if aggregate_only else force),
         ], cf_inputs),
 
         "cf_states": ([
@@ -197,6 +201,9 @@ def parse_args():
                    help=f"Only redo the state aggregations ({', '.join(AGGREGATION_STEPS)}) "
                         "from existing CF / hourly files — no bias correction, "
                         "downscaling or CF computation")
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=None,
+                   help=f"Recompute outputs that already exist; --no-overwrite skips them "
+                        f"(default {CONFIG['overwrite']})")
     return p.parse_args()
 
 
@@ -207,6 +214,8 @@ def main():
         c["gcm"] = args.gcm
     if args.run:
         c["run"] = args.run
+    if args.overwrite is not None:
+        c["overwrite"] = args.overwrite
 
     commands = build_commands(c, args.aggregate_only)
     allowed = AGGREGATION_STEPS if args.aggregate_only else STEPS

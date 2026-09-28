@@ -480,7 +480,7 @@ def cmd_apply(args):
 
     for ssp in args.ssps:
         out_path = Path(args.out_dir) / f"{args.gcm}_{ssp}_hourly.nc"
-        if out_path.exists():
+        if out_path.exists() and not args.force:
             log.info("%s: already exists — skipping", out_path.name)
             continue
 
@@ -679,6 +679,8 @@ def parse_args():
                      help="Calendar half-window in days (default: 30)")
     app.add_argument("--seed",       type=int, default=42,
                      help="Base seed for reproducible stochastic sampling (default: 42)")
+    app.add_argument("--force",      action="store_true",
+                     help="Recompute and overwrite hourly files that already exist")
 
     return p.parse_args()
 

@@ -966,6 +966,7 @@ def process_scenario(
     buffer_km: float = 0.0,
     cap_weights: dict | None = None,   # {"wCF": MW(region, pixel), "sCF": ...}
     aggregate_only: bool = False,      # reuse existing CF NetCDFs, skip maps
+    force: bool = False,               # overwrite existing CF NetCDFs
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """
     Load hourly file for *scenario*, compute hourly wCF and sCF, write NC
@@ -1007,7 +1008,7 @@ def process_scenario(
     # ── Write hourly CF NetCDFs ───────────────────────────────────────────────
     for cf_da, name in ([] if aggregate_only else [(wCF, "wCF"), (sCF, "sCF")]):
         out_nc = out_dir / f"{name}_{gcm}_{scenario}_hourly.nc"
-        if out_nc.exists():
+        if out_nc.exists() and not force:
             log.info("  %s already exists — skipping write", out_nc.name)
         else:
             log.info("  Writing %s …", out_nc.name)
@@ -1127,6 +1128,8 @@ def parse_args():
                    help="Only redo the regional aggregation from the existing "
                         "wCF/sCF hourly NetCDFs in --out-dir (no CF computation, "
                         "validation or maps)")
+    p.add_argument("--force", action="store_true",
+                   help="Recompute and overwrite hourly CF NetCDFs that already exist")
     return p.parse_args()
 
 
@@ -1247,6 +1250,7 @@ def main():
         buffer_km   = args.buffer_km,
         cap_weights = cap_weights,
         aggregate_only = args.aggregate_only,
+        force       = args.force,
     )
     if df_w_hist is not None:
         ts_dfs_wind["historical"]  = df_w_hist
@@ -1271,6 +1275,7 @@ def main():
             buffer_km   = args.buffer_km,
             cap_weights = cap_weights,
             aggregate_only = args.aggregate_only,
+            force       = args.force,
         )
         if df_w is not None:
             ts_dfs_wind[ssp]  = df_w

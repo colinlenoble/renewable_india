@@ -167,6 +167,8 @@ def parse_args():
                    help="Number of quantiles for QDM (default: 50)")
     p.add_argument("--env-dir",      type=Path, default=None,
                    help="Conda env root for ESMFMKFILE (default: sys.prefix)")
+    p.add_argument("--force",        action="store_true",
+                   help="Recompute and overwrite output files that already exist")
     return p.parse_args()
 
 
@@ -258,7 +260,7 @@ def main():
         # 6b. Save historical alignment files (era5_ref + gcm_historical_bc)
         out_era5_ref  = args.out_dir / f"{vname}_era5_ref.nc"
         out_hist_bc   = args.out_dir / f"{vname}_{args.gcm}_historical_bc.nc"
-        if not out_hist_bc.exists():
+        if args.force or not out_hist_bc.exists():
             # apply QDM to the historical period to check alignment with ERA5
             bc_hist = QM.adjust(hist_v, interp="linear", extrapolation="constant")
             if use_log:
@@ -294,7 +296,7 @@ def main():
         # 7. Apply to each SSP scenario
         for ssp in args.ssps:
             out_path = args.out_dir / f"{vname}_{args.gcm}_{ssp}_bc.nc"
-            if out_path.exists():
+            if out_path.exists() and not args.force:
                 log.info("  %s/%s: already exists — skipping", ssp, vname)
                 continue
 
