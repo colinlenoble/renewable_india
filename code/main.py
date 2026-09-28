@@ -57,7 +57,7 @@ CONFIG = {
     "solar_tracker":   ROOT / "aux_data/Global-Solar-Power-Tracker-February-2025.xlsx",
 
     # ── Outputs ───────────────────────────────────────────────────────────────
-    "bc_dir":          ROOT / "data/proc/cmip6_bc",
+    "bc_dir":          ROOT / "data/proc/{gcm}",           # bias-corrected daily files
     "library":         ROOT / "data/proc/era5/diurnal_library_{gcm}.nc",
     "hourly_dir":      ROOT / "data/proc/cmip6_hourly",
     "cf_root":         ROOT / "data/proc/cf",               # CF files in <cf_root>/<gcm>/
