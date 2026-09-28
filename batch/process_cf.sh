@@ -15,19 +15,19 @@ module load anaconda3/2023.09-0/none-none
 source activate /gpfs/workdir/shared/juicce/envs/xenv
 
 # Run python script
-python ../code/bias_correction_qdm.py \
+python ../code/pipeline/bias_correction_qdm.py \
     --era5-dir /gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/data/raw/era5_daily/ \
     --cmip-dir /gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/data/raw/CanESM5/ \
     --env-dir /gpfs/workdir/shared/juicce/envs/xenv \
     --out-dir /gpfs/workdir/shared/juicce/RE_Colin/India/renewable_india/data/proc/CanESM5/ \
     --nquantile 25
-python ../code/downscale_hourly.py \
+python ../code/pipeline/downscale_hourly.py \
     --era5-grib  ../data/raw/era5/era5_india_*.grib \
     --gcm-grid   ../data/proc/cmip6_bc/tas_CanESM5_historical_bc.nc \
     --out-library ../data/proc/era5/diurnal_library_CanESM5.nc \
     --env-dir /gpfs/workdir/shared/juicce/envs/xenv 
 # 2 – Apply (per SSP):
-python ../code/downscale_hourly.py apply \
+python ../code/pipeline/downscale_hourly.py apply \
     --library  ../data/proc/era5/diurnal_library_CanESM5.nc \
     --bc-dir   ../data/proc/cmip6_bc \
     --gcm      CanESM5 --run r10i1p1f1 \
@@ -35,7 +35,7 @@ python ../code/downscale_hourly.py apply \
     --out-dir  ../data/proc/cmip6_hourly
 """
 
-# python ../code/compute_cf.py \
+# python ../code/pipeline/compute_cf.py \
 #     --bc-dir      ../data/proc/cmip6_bc \
 #     --hourly-dir  ../data/proc/cmip6_hourly \
 #     --cmip-dir    ../data/raw/CanESM5 \

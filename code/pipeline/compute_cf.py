@@ -25,6 +25,20 @@ directly to hourly rsds, tas and sfcWind.  Because tasmax is not available
 at hourly resolution the hourly tas is used in its place (conservative;
 see note in solar_cf_hourly).
 
+Hourly wind CF
+--------------
+10 m wind is extrapolated to hub height (default 150 m) with a per-pixel
+Hellmann shear exponent fit on ERA5 u10/v10/u100/v100 over 1982-2001
+(--shear-file; --wind-method shear_uniform uses a single 1/7 instead), then
+passed through the turbine power curve.
+
+Regional aggregation (identical for wCF and sCF)
+------------------------------------------------
+State means are written three ways: area-weighted over the state polygons,
+area-weighted over the polygons buffered by --buffer-km, and weighted by
+operating capacity per pixel from the GEM Global Wind / Solar Power Trackers
+(--wind-capacity-file / --solar-capacity-file).
+
 Input conventions
 -----------------
 Hourly files follow the naming convention produced by downscale_hourly.py:
@@ -42,6 +56,10 @@ Outputs in <out-dir>
     hourly_diurnal_validation_{gcm}.png   (solar CF diurnal cycle)
     {w,s}CF_{gcm}_{scenario}_hourly.nc    (hourly CF grids, all scenarios)
     {w,s}CF_{gcm}_{scenario}_states_annual.csv
+    {w,s}CF_{gcm}_{scenario}_states_buffer{km}km_annual.csv   (if --buffer-km > 0)
+    wCF_{gcm}_{scenario}_states_capacity_annual.csv   (if --wind-capacity-file)
+    sCF_{gcm}_{scenario}_states_capacity_annual.csv   (if --solar-capacity-file)
+    {wind,solar}_capacity_projects_used.csv
     timeseries_{w,s}CF_{gcm}.png
     map_{w,s}CF_{gcm}_{ssp}.png
 
@@ -57,7 +75,9 @@ python compute_cf.py \\
     --ssps        ssp245 ssp585                    \\
     --train-start 1980-01-01                       \\
     --train-end   2010-12-31                       \\
-    --region-col  STNAME_SH
+    --region-col  STNAME_SH                        \\
+    --shear-file  /data/era5/shear_exponent_local_1982-01-01_2001-12-31.nc \\
+    --wind-capacity-file /data/Global-Wind-Power-Tracker-February-2026.xlsx
 """
 
 import argparse
@@ -93,15 +113,29 @@ log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
+WIND_METHODS = ("shear_local", "shear_uniform")
+
+# Per-pixel Hellmann shear exponent fit from ERA5 daily u10/v10/u100/v100
+# over 1982-2001 (see Compound_ER/code_reviewed/fit_local_shear.py).
+DEFAULT_SHEAR_FILE = Path(
+    r"E:\climate_data\ERA5\shear_exponent_local_1982-01-01_2001-12-31.nc"
+)
+
+
 @dataclass
 class CFConfig:
     # Wind turbine parameters
     vr:         float = 13.0    # rated wind speed (m s-1)
     vci:        float = 3.5     # cut-in wind speed (m s-1)
     vco:        float = 25.0    # cut-out wind speed (m s-1)
-    hub_height: float = 80.0    # hub height (m)
+    hub_height: float = 150.0   # hub height (m)
     ref_height: float = 10.0    # reference height for wind obs (m)
-    alpha:      float = 0.143   # wind shear exponent (power law)
+    # Wind extrapolation ref_height -> hub_height (see get_hub_height_wind)
+    #   'shear_local'   : per-pixel alpha read from shear_file (default)
+    #   'shear_uniform' : single exponent uniform_shear_exponent everywhere
+    wind_method:            str   = "shear_local"
+    uniform_shear_exponent: float = 1.0 / 7.0
+    shear_file:             Path  = DEFAULT_SHEAR_FILE
     # Solar PV parameters
     gamma:      float = -0.005  # temperature coefficient of power (K-1)
     T_ref:      float = 25.0    # STC reference temperature (°C)
@@ -111,6 +145,11 @@ class CFConfig:
     c2:         float = 0.943
     c3:         float = 0.028
     c4:         float = -1.528
+
+    def __post_init__(self):
+        if self.wind_method not in WIND_METHODS:
+            raise ValueError(
+                f"wind_method must be one of {WIND_METHODS}, got {self.wind_method!r}")
 
 CFG = CFConfig()
 
@@ -253,22 +292,83 @@ def infer_meta_from_hourly(path: Path) -> tuple[str, str, str]:
 # CF formulas — hourly versions
 # ══════════════════════════════════════════════════════════════════════════════
 
-def wind_cf_hourly(sfcWind: xr.DataArray, cfg: CFConfig = CFG) -> xr.DataArray:
+def load_local_shear_exponent(
+    target: xr.Dataset | xr.DataArray, cfg: CFConfig = CFG
+) -> xr.DataArray:
     """
-    Instantaneous wind CF from hourly sfcWind.
-    Power-law extrapolation from ref_height to hub_height, then piecewise
-    cubic / constant turbine power curve.
+    Per-pixel Hellmann shear exponent from cfg.shear_file, interpolated
+    (bilinear) onto target's lat/lon grid.
+
+    The file is global on a 0.5° ERA5 grid with descending latitude; it is
+    renamed to lat/lon, sorted, and interpolated so that downstream
+    broadcasting against the hourly wind is exact.
     """
-    w = sfcWind * (cfg.hub_height / cfg.ref_height) ** cfg.alpha
+    if not Path(cfg.shear_file).exists():
+        raise FileNotFoundError(f"Shear exponent file not found: {cfg.shear_file}")
+    with xr.open_dataset(cfg.shear_file) as ds:
+        alpha = ds["alpha"].load()
+    alpha = alpha.rename(
+        {k: v for k, v in {"latitude": "lat", "longitude": "lon"}.items()
+         if k in alpha.dims}
+    ).sortby("lat").sortby("lon")
+    alpha = alpha.interp(lat=target["lat"], lon=target["lon"], method="linear")
+    n_nan = int(alpha.isnull().sum())
+    if n_nan:
+        log.warning("  %d target pixels have no local shear exponent (NaN wCF there)", n_nan)
+    # float32 so the hourly wCF computed from it stays float32 (halves disk/RAM)
+    return alpha.astype(np.float32).rename("alpha")
+
+
+def get_hub_height_wind(
+    sfcWind: xr.DataArray, cfg: CFConfig = CFG, alpha: xr.DataArray | None = None
+) -> xr.DataArray:
+    """
+    Wind speed at cfg.hub_height, power-law extrapolated from cfg.ref_height:
+      'shear_local'   : per-pixel alpha (see load_local_shear_exponent)
+      'shear_uniform' : single exponent cfg.uniform_shear_exponent
+    """
+    if cfg.wind_method == "shear_uniform":
+        exponent = cfg.uniform_shear_exponent
+    elif cfg.wind_method == "shear_local":
+        if alpha is None:
+            raise ValueError(
+                "wind_method='shear_local' requires a per-pixel alpha "
+                "(see load_local_shear_exponent)")
+        exponent = alpha
+    else:
+        raise ValueError(f"Unknown wind_method {cfg.wind_method!r}")
+    return sfcWind * (cfg.hub_height / cfg.ref_height) ** exponent
+
+
+def wind_cf_from_hub_wind(w: xr.DataArray, cfg: CFConfig = CFG) -> xr.DataArray:
+    """
+    Piecewise turbine power curve applied to hub-height wind: 0 below cut-in,
+    cubic ramp to rated, 1 between rated and cut-out, 0 above cut-out.
+    NaN wind stays NaN.
+    """
     cf = xr.where(w < cfg.vci,  0.0,
          xr.where(w >= cfg.vco, 0.0,
          xr.where(w >= cfg.vr,  1.0,
                   (w ** 3 - cfg.vci ** 3) / (cfg.vr ** 3 - cfg.vci ** 3))))
-    cf = cf.rename("wCF")
+    return cf.where(w.notnull())
+
+
+def wind_cf_hourly(
+    sfcWind: xr.DataArray, cfg: CFConfig = CFG, alpha: xr.DataArray | None = None
+) -> xr.DataArray:
+    """
+    Instantaneous wind CF from hourly sfcWind: extrapolation from ref_height
+    to hub_height (get_hub_height_wind), then turbine power curve.
+    """
+    cf = wind_cf_from_hub_wind(get_hub_height_wind(sfcWind, cfg, alpha), cfg)
+    cf = cf.astype(np.float32).rename("wCF")
     cf.attrs = {
         "units":        "1",
         "long_name":    "Wind capacity factor (hourly)",
         "hub_height_m": cfg.hub_height,
+        "wind_method":  cfg.wind_method,
+        "shear":        (str(cfg.shear_file) if cfg.wind_method == "shear_local"
+                         else cfg.uniform_shear_exponent),
         "timestep":     "hourly",
     }
     return cf
@@ -303,7 +403,7 @@ def solar_cf_hourly(
               + cfg.c4 * sfcWind)
     P_R = 1.0 + cfg.gamma * (T_cell - cfg.T_ref)
     cf = (P_R * rsds / cfg.G_stc).clip(min=0.0, max=1.0)
-    cf = cf.rename("sCF")
+    cf = cf.astype(np.float32).rename("sCF")
     cf.attrs = {
         "units":    "1",
         "long_name": "Solar PV capacity factor (hourly)",
@@ -315,12 +415,18 @@ def solar_cf_hourly(
 
 # ── Convenience wrappers that operate on a whole hourly Dataset ───────────────
 
-def compute_cf_from_hourly_ds(ds: xr.Dataset, cfg: CFConfig = CFG):
+def compute_cf_from_hourly_ds(
+    ds: xr.Dataset, cfg: CFConfig = CFG, alpha: xr.DataArray | None = None
+):
     """
     Compute wCF and sCF DataArrays from an hourly Dataset.
+    alpha is the per-pixel shear exponent on ds's grid (loaded from
+    cfg.shear_file if None and cfg.wind_method == 'shear_local').
     Returns (wCF, sCF).
     """
-    wCF = wind_cf_hourly(ds["sfcWind"], cfg)
+    if alpha is None and cfg.wind_method == "shear_local":
+        alpha = load_local_shear_exponent(ds, cfg)
+    wCF = wind_cf_hourly(ds["sfcWind"], cfg, alpha)
     sCF = solar_cf_hourly(ds["tas"], ds["rsds"], ds["sfcWind"], cfg)
     return wCF, sCF
 
@@ -543,7 +649,7 @@ def plot_diurnal_validation(
     ds_hist = load_hourly(hourly_dir, gcm, "historical").sel(
         time=slice(train_start, train_end)
     )
-    _, sCF_hist = compute_cf_from_hourly_ds(ds_hist)
+    sCF_hist = solar_cf_hourly(ds_hist["tas"], ds_hist["rsds"], ds_hist["sfcWind"])
 
     # domain-mean, group by (month, hour-of-day)
     sCF_dm = sCF_hist.mean(["lat", "lon"], skipna=True).load()
@@ -603,6 +709,23 @@ def build_weightmap(ds: xr.Dataset, gdf):
     return xa.pixel_overlaps(ds, gdf)
 
 
+def buffer_regions(gdf, buffer_km: float):
+    """
+    Return a copy of gdf with every polygon expanded by buffer_km, so the
+    regional aggregation also picks up the pixels in proximity of each region
+    (offshore / coastal cells, neighbouring land, and cells around small
+    regions whose own footprint covers few grid cells).
+
+    The buffer is computed in an azimuthal-equidistant projection centred on
+    India so the distance is in true km, then reprojected to EPSG:4326.
+    Buffered regions overlap their neighbours; each is aggregated independently.
+    """
+    aeqd = "+proj=aeqd +lat_0=22 +lon_0=80 +units=m +datum=WGS84"
+    gdf_buf = gdf.to_crs(aeqd)
+    gdf_buf["geometry"] = gdf_buf.geometry.buffer(buffer_km * 1000.0)
+    return gdf_buf.to_crs("EPSG:4326")
+
+
 def regional_annual_mean(
     cf_da: xr.DataArray,
     wm,
@@ -624,6 +747,109 @@ def regional_annual_mean(
         vals.T,
         index=years,
         columns=gdf[region_col].tolist(),
+    )
+
+
+def build_capacity_weights(
+    tracker_file: Path,
+    grid: xr.Dataset,
+    gdf,
+    region_col: str,
+    country: str = "India",
+    statuses: tuple = ("operating",),
+    max_dist_km: float = 50.0,
+) -> tuple[xr.DataArray, pd.DataFrame]:
+    """
+    Installed capacity (MW) per (region, pixel) from a GEM power tracker —
+    Global Wind Power Tracker (sheets 'Data' + 'Below Threshold') or Global
+    Solar Power Tracker (sheets '20 MW+' + '1-20 MW').  Every sheet with the
+    project columns is read, so the same function serves both.
+
+    Each project with a status in *statuses* is assigned to the region that
+    contains it (or the nearest region within max_dist_km, for coastal /
+    border points that fall just outside the polygons) and to the nearest
+    pixel of *grid*.  Capacities of projects sharing a (region, pixel) are
+    summed.
+
+    Returns
+    -------
+    weights  : DataArray (region, lat, lon) of MW, 0 where no capacity
+    projects : DataFrame of the retained projects with their region / pixel
+    """
+    need = ["Country/Area", "Status", "Capacity (MW)", "Latitude", "Longitude"]
+    sheets = pd.read_excel(tracker_file, sheet_name=None)
+    df = pd.concat(
+        [s.assign(sheet=name) for name, s in sheets.items()
+         if set(need).issubset(s.columns)],
+        ignore_index=True,
+    )
+    df = df[(df["Country/Area"] == country) & df["Status"].isin(statuses)]
+    df = df.dropna(subset=["Latitude", "Longitude", "Capacity (MW)"])
+    pts = gpd.GeoDataFrame(
+        df[["Project Name", "Phase Name", "Capacity (MW)", "Status", "sheet"]],
+        geometry=gpd.points_from_xy(df["Longitude"], df["Latitude"]),
+        crs="EPSG:4326",
+    )
+    aeqd = "+proj=aeqd +lat_0=22 +lon_0=80 +units=m +datum=WGS84"
+    joined = gpd.sjoin_nearest(
+        pts.to_crs(aeqd), gdf[[region_col, "geometry"]].to_crs(aeqd),
+        how="inner", max_distance=max_dist_km * 1000.0,
+    )
+    joined = joined[~joined.index.duplicated()]      # ties on shared borders
+    n_drop = len(pts) - len(joined)
+    if n_drop:
+        log.warning("  %d %s projects farther than %g km from any region — dropped",
+                    n_drop, country, max_dist_km)
+
+    lat = grid["lat"].values
+    lon = grid["lon"].values
+    joined["ilat"] = np.abs(lat[None, :] - pts.loc[joined.index].geometry.y.values[:, None]).argmin(1)
+    joined["ilon"] = np.abs(lon[None, :] - pts.loc[joined.index].geometry.x.values[:, None]).argmin(1)
+
+    regions = gdf[region_col].tolist()
+    w = np.zeros((len(regions), len(lat), len(lon)))
+    ireg = joined[region_col].map({r: i for i, r in enumerate(regions)}).values
+    np.add.at(w, (ireg, joined["ilat"].values, joined["ilon"].values),
+              joined["Capacity (MW)"].values)
+    weights = xr.DataArray(
+        w, dims=("region", "lat", "lon"),
+        coords={"region": regions, "lat": grid["lat"], "lon": grid["lon"]},
+        name="capacity_mw",
+    )
+    log.info("  Capacity weights: %d projects, %.1f GW, %d pixels, %d regions with capacity",
+             len(joined), joined["Capacity (MW)"].sum() / 1e3,
+             int((weights.sum("region") > 0).sum()),
+             int((weights.sum(["lat", "lon"]) > 0).sum()))
+    return weights, pd.DataFrame(joined.drop(columns="geometry"))
+
+
+def capacity_weighted_mean(
+    cf_da: xr.DataArray, weights: xr.DataArray
+) -> xr.DataArray:
+    """
+    Capacity-weighted CF per region, at cf_da's own time step:
+        CF_r(t) = Σ_pixels MW(r, pixel) * CF(pixel, t) / Σ_pixels MW(r, pixel)
+    Only pixels holding capacity are touched (a few hundred), so this is cheap
+    even on hourly data.  Pixels with NaN CF are excluded from both sums;
+    regions with no installed capacity are NaN.  Returns (time, region).
+    """
+    w  = weights.stack(pixel=("lat", "lon"))
+    w  = w.isel(pixel=np.flatnonzero(w.sum("region").values > 0))
+    cf = cf_da.stack(pixel=("lat", "lon")).sel(pixel=w["pixel"])
+    num = xr.dot(cf.fillna(0.0), w, dims="pixel")
+    den = xr.dot(cf.notnull().astype(np.float32), w, dims="pixel")
+    return (num / den.where(den > 0)).transpose("time", "region").astype(np.float32)
+
+
+def regional_annual_mean_capacity(
+    cf_da: xr.DataArray, weights: xr.DataArray
+) -> pd.DataFrame:
+    """Capacity-weighted annual-mean CF per region (see capacity_weighted_mean)."""
+    out = capacity_weighted_mean(cf_da.resample(time="YE").mean(skipna=True), weights)
+    return pd.DataFrame(
+        out.values,
+        index=out["time"].dt.year.values,
+        columns=weights["region"].values,
     )
 
 
@@ -732,11 +958,20 @@ def process_scenario(
     region_col: str,
     periods: list,
     is_ssp: bool,
+    cfg: CFConfig = CFG,
+    alpha: xr.DataArray | None = None,
+    wm_buf=None,   # xagg weightmap of the buffered regions (None → skip)
+    buffer_km: float = 0.0,
+    cap_weights: dict | None = None,   # {"wCF": MW(region, pixel), "sCF": ...}
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """
     Load hourly file for *scenario*, compute hourly wCF and sCF, write NC
     outputs, aggregate to annual-mean per state, and produce map plots for
     SSP scenarios.
+
+    wCF and sCF are aggregated the same way: area-weighted over the state
+    polygons, area-weighted over the buffered polygons (if wm_buf), and
+    weighted by installed capacity (for each variable present in cap_weights).
 
     Returns (df_wind_annual, df_solar_annual) or (None, None) on failure.
     """
@@ -754,7 +989,7 @@ def process_scenario(
     n_lon   = len(lon_arr)
 
     # ── Compute CF (lazy) ─────────────────────────────────────────────────────
-    wCF, sCF = compute_cf_from_hourly_ds(ds_h)
+    wCF, sCF = compute_cf_from_hourly_ds(ds_h, cfg, alpha)
 
     # ── Write hourly CF NetCDFs ───────────────────────────────────────────────
     for cf_da, name in [(wCF, "wCF"), (sCF, "sCF")]:
@@ -773,26 +1008,33 @@ def process_scenario(
     # ── Regional annual aggregation ───────────────────────────────────────────
     log.info("  Aggregating by region …")
     # Load into memory in yearly chunks to keep peak RAM manageable
-    df_w_parts, df_s_parts = [], []
+    cap_weights = cap_weights or {}
+    methods = ["area"] + (["buffer"] if wm_buf is not None else [])
+    parts = {(v, m): [] for v in ("wCF", "sCF") for m in methods + ["capacity"]}
     time_idx = pd.DatetimeIndex(ds_h.time.values)
     years    = sorted(set(time_idx.year))
 
     for yr in years:
         t_slice = slice(f"{yr}-01-01", f"{yr}-12-31")
-        wCF_yr  = wCF.sel(time=t_slice).load()
-        sCF_yr  = sCF.sel(time=t_slice).load()
-        df_w_parts.append(
-            regional_annual_mean(wCF_yr, wm, gdf, region_col)
-        )
-        df_s_parts.append(
-            regional_annual_mean(sCF_yr, wm, gdf, region_col)
-        )
-        del wCF_yr, sCF_yr
+        for name, cf_da in [("wCF", wCF), ("sCF", sCF)]:
+            cf_yr = cf_da.sel(time=t_slice).load()
+            parts[(name, "area")].append(
+                regional_annual_mean(cf_yr, wm, gdf, region_col))
+            if wm_buf is not None:
+                parts[(name, "buffer")].append(
+                    regional_annual_mean(cf_yr, wm_buf, gdf, region_col))
+            if name in cap_weights:
+                parts[(name, "capacity")].append(
+                    regional_annual_mean_capacity(cf_yr, cap_weights[name]))
+            del cf_yr
 
-    df_w = pd.concat(df_w_parts)
-    df_s = pd.concat(df_s_parts)
-    df_w.to_csv(out_dir / f"wCF_{gcm}_{scenario}_states_annual.csv")
-    df_s.to_csv(out_dir / f"sCF_{gcm}_{scenario}_states_annual.csv")
+    suffix = {"area": "", "buffer": f"_buffer{buffer_km:g}km", "capacity": "_capacity"}
+    for (name, method), dfs in parts.items():
+        if dfs:
+            pd.concat(dfs).to_csv(
+                out_dir / f"{name}_{gcm}_{scenario}_states{suffix[method]}_annual.csv")
+    df_w = pd.concat(parts[("wCF", "area")])
+    df_s = pd.concat(parts[("sCF", "area")])
 
     # ── 20-year maps (SSP scenarios only) ────────────────────────────────────
     if is_ssp:
@@ -845,6 +1087,24 @@ def parse_args():
     p.add_argument("--train-start", default="1980-01-01")
     p.add_argument("--train-end",   default="2010-12-31")
     p.add_argument("--region-col",  default="STNAME_SH")
+    p.add_argument("--hub-height",  type=float, default=CFG.hub_height,
+                   help="Turbine hub height (m)")
+    p.add_argument("--wind-method", choices=WIND_METHODS, default=CFG.wind_method,
+                   help="10 m -> hub height extrapolation: per-pixel alpha "
+                        "(shear_local) or a single 1/7 exponent (shear_uniform)")
+    p.add_argument("--shear-file",  type=Path, default=DEFAULT_SHEAR_FILE,
+                   help="NetCDF with per-pixel shear exponent 'alpha' "
+                        "(used when --wind-method shear_local)")
+    p.add_argument("--buffer-km",   type=float, default=50.0,
+                   help="Also aggregate wCF/sCF over each region expanded by "
+                        "this distance (km), to include pixels in its "
+                        "proximity; 0 disables")
+    p.add_argument("--wind-capacity-file", type=Path, default=None,
+                   help="GEM Global Wind Power Tracker .xlsx; if given, also "
+                        "aggregate wCF weighted by operating capacity per pixel")
+    p.add_argument("--solar-capacity-file", type=Path, default=None,
+                   help="GEM Global Solar Power Tracker .xlsx; if given, also "
+                        "aggregate sCF weighted by operating capacity per pixel")
     p.add_argument("--skip-validation", action="store_true",
                    help="Skip daily BC validation plots (saves time if already produced)")
     return p.parse_args()
@@ -915,6 +1175,32 @@ def main():
         ds_grid = _ds.isel(time=0).drop_vars("time", errors="ignore")
     log.info("Building xagg weightmap …")
     wm = build_weightmap(ds_grid, gdf)
+    wm_buf = None
+    if args.buffer_km > 0:
+        log.info("Building xagg weightmap for regions buffered by %g km …", args.buffer_km)
+        wm_buf = build_weightmap(ds_grid, buffer_regions(gdf, args.buffer_km))
+    cap_weights = {}
+    for name, tech, tracker in [("wCF", "wind",  args.wind_capacity_file),
+                                ("sCF", "solar", args.solar_capacity_file)]:
+        if tracker is None:
+            continue
+        log.info("Building %s capacity weights from %s …", tech, tracker)
+        cap_weights[name], projects = build_capacity_weights(
+            tracker, ds_grid, gdf, args.region_col)
+        projects.to_csv(args.out_dir / f"{tech}_capacity_projects_used.csv", index=False)
+
+    cfg = CFConfig(
+        hub_height  = args.hub_height,
+        wind_method = args.wind_method,
+        shear_file  = args.shear_file,
+    )
+    alpha = None
+    if cfg.wind_method == "shear_local":
+        log.info("Loading local shear exponent from %s …", cfg.shear_file)
+        alpha = load_local_shear_exponent(ds_grid, cfg)
+        log.info("  alpha on grid: min %.3f  mean %.3f  max %.3f",
+                 float(alpha.min()), float(alpha.mean()), float(alpha.max()))
+    log.info("Wind: hub height %.0f m, method %s", cfg.hub_height, cfg.wind_method)
 
     ts_dfs_wind  = {}
     ts_dfs_solar = {}
@@ -931,6 +1217,11 @@ def main():
         region_col  = args.region_col,
         periods     = PERIODS,
         is_ssp      = False,
+        cfg         = cfg,
+        alpha       = alpha,
+        wm_buf      = wm_buf,
+        buffer_km   = args.buffer_km,
+        cap_weights = cap_weights,
     )
     if df_w_hist is not None:
         ts_dfs_wind["historical"]  = df_w_hist
@@ -949,6 +1240,11 @@ def main():
             region_col  = args.region_col,
             periods     = PERIODS,
             is_ssp      = True,
+            cfg         = cfg,
+            alpha       = alpha,
+            wm_buf      = wm_buf,
+            buffer_km   = args.buffer_km,
+            cap_weights = cap_weights,
         )
         if df_w is not None:
             ts_dfs_wind[ssp]  = df_w
