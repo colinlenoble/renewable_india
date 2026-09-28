@@ -963,11 +963,15 @@ def process_scenario(
     wm_buf=None,   # xagg weightmap of the buffered regions (None → skip)
     buffer_km: float = 0.0,
     cap_weights: dict | None = None,   # {"wCF": MW(region, pixel), "sCF": ...}
+    aggregate_only: bool = False,      # reuse existing CF NetCDFs, skip maps
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """
     Load hourly file for *scenario*, compute hourly wCF and sCF, write NC
     outputs, aggregate to annual-mean per state, and produce map plots for
     SSP scenarios.
+
+    With aggregate_only, the hourly wCF/sCF NetCDFs written by a previous run
+    are read back instead, and only the regional aggregation is redone.
 
     wCF and sCF are aggregated the same way: area-weighted over the state
     polygons, area-weighted over the buffered polygons (if wm_buf), and
@@ -977,22 +981,29 @@ def process_scenario(
     """
     log.info("━━━ %s ━━━", scenario)
 
-    try:
-        ds_h = load_hourly(hourly_dir, gcm, scenario)
-    except FileNotFoundError as exc:
-        log.error("  %s — skipping", exc)
-        return None, None
+    if aggregate_only:
+        paths = [out_dir / f"{name}_{gcm}_{scenario}_hourly.nc" for name in ("wCF", "sCF")]
+        missing = [str(p) for p in paths if not p.exists()]
+        if missing:
+            log.error("  CF file(s) not found: %s — skipping", ", ".join(missing))
+            return None, None
+        wCF, sCF = (xr.open_dataset(p, chunks={"time": 24 * 30})[name]
+                    for p, name in zip(paths, ("wCF", "sCF")))
+        time_idx = pd.DatetimeIndex(wCF.time.values)
+    else:
+        try:
+            ds_h = load_hourly(hourly_dir, gcm, scenario)
+        except FileNotFoundError as exc:
+            log.error("  %s — skipping", exc)
+            return None, None
+        time_idx = pd.DatetimeIndex(ds_h.time.values)
+        n_lat, n_lon = ds_h.sizes["lat"], ds_h.sizes["lon"]
 
-    lat_arr = ds_h["lat"].values
-    lon_arr = ds_h["lon"].values
-    n_lat   = len(lat_arr)
-    n_lon   = len(lon_arr)
-
-    # ── Compute CF (lazy) ─────────────────────────────────────────────────────
-    wCF, sCF = compute_cf_from_hourly_ds(ds_h, cfg, alpha)
+        # ── Compute CF (lazy) ─────────────────────────────────────────────────
+        wCF, sCF = compute_cf_from_hourly_ds(ds_h, cfg, alpha)
 
     # ── Write hourly CF NetCDFs ───────────────────────────────────────────────
-    for cf_da, name in [(wCF, "wCF"), (sCF, "sCF")]:
+    for cf_da, name in ([] if aggregate_only else [(wCF, "wCF"), (sCF, "sCF")]):
         out_nc = out_dir / f"{name}_{gcm}_{scenario}_hourly.nc"
         if out_nc.exists():
             log.info("  %s already exists — skipping write", out_nc.name)
@@ -1011,7 +1022,6 @@ def process_scenario(
     cap_weights = cap_weights or {}
     methods = ["area"] + (["buffer"] if wm_buf is not None else [])
     parts = {(v, m): [] for v in ("wCF", "sCF") for m in methods + ["capacity"]}
-    time_idx = pd.DatetimeIndex(ds_h.time.values)
     years    = sorted(set(time_idx.year))
 
     for yr in years:
@@ -1037,7 +1047,7 @@ def process_scenario(
     df_s = pd.concat(parts[("sCF", "area")])
 
     # ── 20-year maps (SSP scenarios only) ────────────────────────────────────
-    if is_ssp:
+    if is_ssp and not aggregate_only:
         log.info("  20-year maps …")
         for cf_da, name, cmap, (vmin, vmax) in [
             (wCF, "wCF", "Blues",   (0.0, 0.50)),
@@ -1055,7 +1065,11 @@ def process_scenario(
             )
             del cf_20y
 
-    ds_h.close()
+    if aggregate_only:
+        wCF.close()
+        sCF.close()
+    else:
+        ds_h.close()
     return df_w, df_s
 
 
@@ -1107,6 +1121,10 @@ def parse_args():
                         "aggregate sCF weighted by operating capacity per pixel")
     p.add_argument("--skip-validation", action="store_true",
                    help="Skip daily BC validation plots (saves time if already produced)")
+    p.add_argument("--aggregate-only", action="store_true",
+                   help="Only redo the regional aggregation from the existing "
+                        "wCF/sCF hourly NetCDFs in --out-dir (no CF computation, "
+                        "validation or maps)")
     return p.parse_args()
 
 
@@ -1122,7 +1140,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════
     # 0. Validation — daily BC alignment
     # ══════════════════════════════════════════════════════════════════════════
-    if not args.skip_validation:
+    if not (args.skip_validation or args.aggregate_only):
         log.info("══ Daily BC validation plots ══")
         val_results = {}
         for vname in ["tas", "tasmax", "sfcWind", "rsds"]:
@@ -1152,12 +1170,13 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════
     # 0b. Hourly diurnal validation (solar CF on training period)
     # ══════════════════════════════════════════════════════════════════════════
-    log.info("══ Hourly diurnal validation ══")
-    plot_diurnal_validation(
-        args.hourly_dir, args.gcm,
-        args.train_start, args.train_end,
-        args.out_dir / f"hourly_diurnal_validation_{args.gcm}.png",
-    )
+    if not args.aggregate_only:
+        log.info("══ Hourly diurnal validation ══")
+        plot_diurnal_validation(
+            args.hourly_dir, args.gcm,
+            args.train_start, args.train_end,
+            args.out_dir / f"hourly_diurnal_validation_{args.gcm}.png",
+        )
 
     # ══════════════════════════════════════════════════════════════════════════
     # 1–3. Hourly CF for historical + SSP scenarios
@@ -1171,6 +1190,9 @@ def main():
     mask_source = hourly_nc_path(args.hourly_dir, args.gcm, "historical")
     if not mask_source.exists():
         mask_source = hourly_nc_path(args.hourly_dir, args.gcm, args.ssps[0])
+    if args.aggregate_only and not mask_source.exists():
+        # same grid as the hourly inputs
+        mask_source = args.out_dir / f"wCF_{args.gcm}_historical_hourly.nc"
     with xr.open_dataset(mask_source) as _ds:
         ds_grid = _ds.isel(time=0).drop_vars("time", errors="ignore")
     log.info("Building xagg weightmap …")
@@ -1195,7 +1217,7 @@ def main():
         shear_file  = args.shear_file,
     )
     alpha = None
-    if cfg.wind_method == "shear_local":
+    if cfg.wind_method == "shear_local" and not args.aggregate_only:
         log.info("Loading local shear exponent from %s …", cfg.shear_file)
         alpha = load_local_shear_exponent(ds_grid, cfg)
         log.info("  alpha on grid: min %.3f  mean %.3f  max %.3f",
@@ -1222,6 +1244,7 @@ def main():
         wm_buf      = wm_buf,
         buffer_km   = args.buffer_km,
         cap_weights = cap_weights,
+        aggregate_only = args.aggregate_only,
     )
     if df_w_hist is not None:
         ts_dfs_wind["historical"]  = df_w_hist
@@ -1245,6 +1268,7 @@ def main():
             wm_buf      = wm_buf,
             buffer_km   = args.buffer_km,
             cap_weights = cap_weights,
+            aggregate_only = args.aggregate_only,
         )
         if df_w is not None:
             ts_dfs_wind[ssp]  = df_w

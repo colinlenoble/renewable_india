@@ -23,6 +23,8 @@ Usage (from anywhere; paths are resolved from the repository root)
 python code/main.py                              # all steps
 python code/main.py --steps cf cf_states         # a subset, in pipeline order
 python code/main.py --dry-run                    # print the commands only
+python code/main.py --aggregate-only             # redo only the state aggregations
+                                                 # from the existing CF / hourly files
 """
 
 import argparse
@@ -54,7 +56,7 @@ CONFIG = {
     "region_col":      "STNAME_SH",
     "shear_file":      ROOT / "aux_data/shear_exponent_local_1982-01-01_2001-12-31.nc",
     "wind_tracker":    ROOT / "aux_data/Global-Wind-Power-Tracker-February-2026.xlsx",
-    "solar_tracker":   ROOT / "aux_data/Global-Solar-Power-Tracker-February-2025.xlsx",
+    "solar_tracker":   ROOT / "aux_data/Global-Solar-Power-Tracker-February-2026.xlsx",
 
     # ── Outputs ───────────────────────────────────────────────────────────────
     "bc_dir":          ROOT / "data/proc/{gcm}",           # bias-corrected daily files
@@ -76,6 +78,7 @@ CONFIG = {
 }
 
 STEPS = ["bias_correction", "diurnal_fit", "diurnal_apply", "cf", "cf_states", "tas_states"]
+AGGREGATION_STEPS = ["cf", "cf_states", "tas_states"]   # run with --aggregate-only
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,11 +93,19 @@ def _p(key: str, c: dict) -> Path:
     return Path(str(c[key]).format(gcm=c["gcm"]))
 
 
-def build_commands(c: dict) -> dict[str, tuple[list[str], list[Path]]]:
+def build_commands(c: dict, aggregate_only: bool = False
+                   ) -> dict[str, tuple[list[str], list[Path]]]:
     """{step: (argv, input files that must exist before the step runs)}"""
     py, gcm = sys.executable, c["gcm"]
     scenarios = ["historical", *c["ssps"]]
     cf_dir = _p("cf_root", c) / gcm
+
+    # compute_cf.py: aggregation-only reads the existing CF files, not the hourly inputs
+    cf_inputs = [_p("shapefile", c), _p("wind_tracker", c), _p("solar_tracker", c)]
+    if aggregate_only:
+        cf_inputs += [cf_dir / f"{v}_{gcm}_historical_hourly.nc" for v in ("wCF", "sCF")]
+    else:
+        cf_inputs += [_p("hourly_dir", c) / f"{gcm}_historical_hourly.nc", _p("shear_file", c)]
 
     return {
         "bias_correction": ([
@@ -145,8 +156,8 @@ def build_commands(c: dict) -> dict[str, tuple[list[str], list[Path]]]:
             "--wind-capacity-file", str(_p("wind_tracker", c)),
             "--solar-capacity-file", str(_p("solar_tracker", c)),
             *(["--skip-validation"] if c["skip_validation"] else []),
-        ], [_p("hourly_dir", c) / f"{gcm}_historical_hourly.nc", _p("shapefile", c),
-            _p("shear_file", c), _p("wind_tracker", c), _p("solar_tracker", c)]),
+            *(["--aggregate-only"] if aggregate_only else []),
+        ], cf_inputs),
 
         "cf_states": ([
             py, str(PIPELINE / "aggregate_cf_states.py"),
@@ -182,6 +193,10 @@ def parse_args():
     p.add_argument("--gcm", default=None, help=f"Override GCM (default {CONFIG['gcm']})")
     p.add_argument("--run", default=None, help=f"Override member (default {CONFIG['run']})")
     p.add_argument("--dry-run", action="store_true", help="Print commands without running")
+    p.add_argument("--aggregate-only", action="store_true",
+                   help=f"Only redo the state aggregations ({', '.join(AGGREGATION_STEPS)}) "
+                        "from existing CF / hourly files — no bias correction, "
+                        "downscaling or CF computation")
     return p.parse_args()
 
 
@@ -193,8 +208,9 @@ def main():
     if args.run:
         c["run"] = args.run
 
-    commands = build_commands(c)
-    for step in [s for s in STEPS if s in args.steps]:
+    commands = build_commands(c, args.aggregate_only)
+    allowed = AGGREGATION_STEPS if args.aggregate_only else STEPS
+    for step in [s for s in allowed if s in args.steps]:
         argv, inputs = commands[step]
         log.info("══ %s ══", step)
         log.info("  %s", " ".join(argv))
