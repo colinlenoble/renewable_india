@@ -1,5 +1,6 @@
 data/
-.claude/__pycache__/
+__pycache__/
+*.pyc
 docs/
 figures/
 .claude/
