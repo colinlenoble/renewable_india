@@ -550,6 +550,8 @@ def plot_validate_var(
     ]
 
     def _bias_panel(ax, bias_da, title):
+        # QDM output (xclim) can come back as (lon, lat) — pcolormesh needs (lat, lon)
+        bias_da = bias_da.transpose("lat", "lon")
         p = ax.pcolormesh(
             bias_da.lon, bias_da.lat, bias_da.values,
             cmap="RdBu_r", vmin=-vabs, vmax=vabs,
