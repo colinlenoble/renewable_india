@@ -8,12 +8,12 @@ import warnings
 from tqdm import tqdm
 
 # ---- Configuration ----
-OUTPUT_DIR = './data/raw/'
+OUTPUT_DIR = 'E:/temp/data/raw/'
 
 # Bounding box from INDIA_STATES.geojson
 INDIA_BBOX = {'lat': [6.75, 37.08], 'lon': [68.09, 97.42]}
 
-EXPERIMENTS  = ['historical', 'ssp119', 'ssp245', 'ssp370', 'ssp585']
+EXPERIMENTS  = ['historical', 'ssp126', 'ssp370', 'ssp245', 'ssp585']
 VARIABLES    = ['rsds', 'uas', 'vas', 'tas', 'tasmax']
 TABLE_ID     = 'day'
 MAX_RUNS     = 1      # max ensemble members per (model, experiment)
@@ -63,12 +63,35 @@ def main(gcm_list):
         .reset_index()
     )
 
-    # Limit ensemble members per (model, experiment) — pick the same member across variables
+    # Keep only (model, member) combinations where EVERY requested experiment has all
+    # requested variables available — e.g. don't download ssp126 for a member if ssp370
+    # is missing rsds, since the two scenarios are needed together downstream.
+    run_vars = cmip6_sub.groupby(['source_id', 'member_id', 'experiment_id'])['variable_id'].agg(set)
+    complete_mask = run_vars.apply(lambda v: set(VARIABLES).issubset(v))
+
+    for (mod, member, exp), found in run_vars[~complete_mask].items():
+        missing = sorted(set(VARIABLES) - found)
+        print(f'{mod} | {member} | {exp}: missing variables {missing}.')
+
+    member_ok = complete_mask.groupby(level=['source_id', 'member_id']).apply(
+        lambda s: len(s) == len(EXPERIMENTS) and s.all()
+    )
+
+    for mod, member in member_ok[~member_ok].index:
+        print(f'Skipping {mod} | {member}: not all of {EXPERIMENTS} have every variable.')
+
+    complete_runs = member_ok[member_ok].index.to_frame(index=False)
+    cmip6_sub = cmip6_sub.merge(complete_runs, on=['source_id', 'member_id'])
+
+    # Limit ensemble members per (model, experiment) — pick the same member across variables.
+    # Incomplete runs were already dropped above, so this naturally falls through to the next
+    # available member instead of just losing that (model, experiment) slot.
     if MAX_RUNS is not None:
         # Identify the first MAX_RUNS members per (model, experiment)
         kept_members = (
             cmip6_sub[['source_id', 'experiment_id', 'member_id']]
             .drop_duplicates()
+            .sort_values('member_id')
             .groupby(['source_id', 'experiment_id'])
             .head(MAX_RUNS)
         )
@@ -128,5 +151,6 @@ def main(gcm_list):
 
 
 if __name__ == '__main__':
-    gcm_list = ['CanESM5']
+    gcm_list = ['GFDL-ESM4']
+
     main(gcm_list)

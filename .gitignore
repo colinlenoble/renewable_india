@@ -1,2 +1,6 @@
 data/
+.claude/__pycache__/
+docs/
+figures/
 .claude/
+notebooks/
