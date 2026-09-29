@@ -5,7 +5,10 @@ QDM bias correction — ERA5 reference → GCM historical → future SSPs.
 Pipeline (one variable at a time to keep RAM low):
   1. Load ERA5, drop extra coords, convert to noleap calendar
   2. Load GCM historical (training period)
-  3. Regrid ERA5 (0.25°) → GCM grid with xesmf bilinear
+  3. Re-aggregate ERA5 (0.25°) → GCM grid, conservatively, weighted by the
+     installed capacity of each ERA5 pixel (sfcWind: wind tracker, rsds: solar
+     tracker; tas/tasmax: area only).  A small capacity jitter keeps cells
+     without capacity at their area-weighted mean (see capacity.py).
   4. Align time axes on common dates
   5. Train QuantileDeltaMapping (xclim)
   6. Load each SSP future, apply QDM, write NetCDF
@@ -21,7 +24,9 @@ python bias_correction_qdm.py \\
     --ssps       ssp245 ssp585          \\
     --train-start 1980-01-01            \\
     --train-end   2010-12-31            \\
-    --nquantiles  50
+    --nquantiles  50                    \
+    --wind-capacity-file  aux_data/Global-Wind-Power-Tracker-February-2026.xlsx \
+    --solar-capacity-file aux_data/Global-Solar-Power-Tracker-February-2026.xlsx
 """
 
 import os
@@ -37,6 +42,9 @@ import xarray as xr
 from xarray.coding.calendar_ops import convert_calendar
 from xclim import sdba
 from xclim.sdba import processing as sdba_proc
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from capacity import DEFAULT_JITTER_MW, WeightedConservativeRegridder, tracker_capacity_maps  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +62,9 @@ VAR_CFG = {
     "sfcWind": ("+", True,  1e-6,  "m s-1"),
     "rsds":    ("+", True,  1e-6,  "W m-2"),
 }
+# ERA5 → GCM re-aggregation weights: var → technology whose capacity weights it
+# (vars not listed are area-weighted)
+VAR_TECH = {"sfcWind": "wind", "rsds": "solar"}
 
 
 # ── I/O helpers ───────────────────────────────────────────────────────────────────
@@ -167,6 +178,15 @@ def parse_args():
                    help="Number of quantiles for QDM (default: 50)")
     p.add_argument("--env-dir",      type=Path, default=None,
                    help="Conda env root for ESMFMKFILE (default: sys.prefix)")
+    p.add_argument("--wind-capacity-file",  type=Path, default=None,
+                   help="GEM Global Wind Power Tracker .xlsx — weights the ERA5 → GCM "
+                        "re-aggregation of sfcWind (area-weighted if omitted)")
+    p.add_argument("--solar-capacity-file", type=Path, default=None,
+                   help="GEM Global Solar Power Tracker .xlsx — weights the ERA5 → GCM "
+                        "re-aggregation of rsds (area-weighted if omitted)")
+    p.add_argument("--capacity-jitter", type=float, default=DEFAULT_JITTER_MW,
+                   help="Capacity floor (MW per ERA5 pixel) so no GCM cell is "
+                        f"capacity-free (default {DEFAULT_JITTER_MW:g})")
     p.add_argument("--force",        action="store_true",
                    help="Recompute and overwrite output files that already exist")
     return p.parse_args()
@@ -187,6 +207,8 @@ def main():
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     TRAIN = slice(args.train_start, args.train_end)
+    trackers = {"wind": args.wind_capacity_file, "solar": args.solar_capacity_file}
+    cap_maps, cap_grid = None, None   # {var: MW per ERA5 pixel}, and the grid it is on
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Variable loop — load, regrid, train, apply, free
@@ -213,20 +235,22 @@ def main():
         ref_lat = hist_da.lat
         ref_lon = hist_da.lon
 
-        # 3. Regrid ERA5 → GCM grid with xesmf
-        log.info("  Regridding ERA5 → %s grid …", args.gcm)
-        target_grid = (
-            hist_da.isel(time=0)
-            .drop_vars("time", errors="ignore")
-            .to_dataset(name=vname)
+        # 3. Re-aggregate ERA5 → GCM grid, weighted by installed capacity
+        era5_grid = (era5_ds.sizes["lat"], era5_ds.sizes["lon"],
+                     float(era5_ds.lat[0]), float(era5_ds.lon[0]))
+        if cap_grid != era5_grid:
+            log.info("  Building capacity maps on the ERA5 grid …")
+            cap_maps = tracker_capacity_maps(era5_ds, trackers, VAR_TECH)
+            cap_grid = era5_grid
+        target_grid = hist_da.isel(time=0).drop_vars("time", errors="ignore")
+        regridder = WeightedConservativeRegridder(
+            era5_ds, target_grid, xe,
+            capacity={vname: cap_maps[vname]} if vname in cap_maps else None,
+            jitter_mw=args.capacity_jitter,
         )
-        regridder = xe.Regridder(
-            era5_ds, target_grid,
-            method="bilinear",
-            extrap_method="nearest_s2d",
-            reuse_weights=False,
-        )
-        era5_rg = regridder(era5_ds)[vname]
+        regrid_desc = regridder.describe(vname)
+        log.info("  ERA5 → %s grid: %s …", args.gcm, regrid_desc)
+        era5_rg = regridder.regrid_da(era5_ds[vname], vname)
         era5_rg.attrs["units"] = unit
         era5_rg = era5_rg.dropna(dim='time', how='all')
         # override lat/lon to exact GCM float values (avoids tiny FP mismatches)
@@ -272,6 +296,7 @@ def main():
             ds_ref[vname].attrs["units"] = unit
             ds_ref.attrs = {
                 "description": f"ERA5 regridded to {args.gcm} grid — {vname}",
+                "regridding": regrid_desc,
                 "gcm": args.gcm,
             }
             ds_ref.to_netcdf(out_era5_ref)
@@ -285,6 +310,7 @@ def main():
                                 f"{args.gcm} {args.run}"),
                 "method": "Quantile Delta Mapping (Cannon et al. 2015) via xclim.sdba",
                 "reference": f"ERA5 daily {args.train_start} – {args.train_end}",
+                "reference_regridding": regrid_desc,
                 "gcm": args.gcm, "run": args.run, "ssp": "historical",
             }
             ds_hbc.to_netcdf(out_hist_bc)
@@ -329,6 +355,7 @@ def main():
                                 f"{args.gcm} {args.run} {ssp}"),
                 "method": "Quantile Delta Mapping (Cannon et al. 2015) via xclim.sdba",
                 "reference": f"ERA5 daily {args.train_start} – {args.train_end}",
+                "reference_regridding": regrid_desc,
                 "gcm": args.gcm,
                 "run": args.run,
                 "ssp": ssp,

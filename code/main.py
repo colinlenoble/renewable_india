@@ -10,10 +10,15 @@ Runs, in order, with the configuration below:
     cf_states        pipeline/aggregate_cf_states.py      hourly state series of wCF / sCF
     tas_states       pipeline/aggregate_tas_states.py     hourly state series of tas
 
+ERA5 -> GCM grid (bias-correction reference and diurnal library): conservative
+re-aggregation weighted by operating capacity per ERA5 pixel (sfcWind: wind,
+rsds: solar, tas: area only), plus a small capacity jitter so cells without
+capacity keep their area-weighted mean.
 Wind CF: 10 m wind -> 150 m with the per-pixel ERA5 shear exponent.
 State aggregation (wCF and sCF alike): area-weighted, area-weighted over
 regions buffered by 50 km, and weighted by operating capacity per pixel
-(GEM Global Wind / Solar Power Trackers).
+(GEM Global Wind / Solar Power Trackers, + the same capacity jitter so no
+state is left without a capacity-weighted value).
 
 The raw-data downloads (pipeline/download_*.py) are not part of this driver:
 they need CDS / ESGF network access and are run once, beforehand.
@@ -74,6 +79,7 @@ CONFIG = {
     "hub_height":      150,       # m
     "wind_method":     "shear_local",
     "buffer_km":       50,
+    "capacity_jitter_mw": 1e-3,   # capacity floor (MW per pixel) in all capacity weightings
     "skip_validation": False,     # daily BC validation plots in compute_cf
     "overwrite":       True,      # recompute outputs that already exist (else skip them)
 }
@@ -101,6 +107,10 @@ def build_commands(c: dict, aggregate_only: bool = False
     scenarios = ["historical", *c["ssps"]]
     cf_dir = _p("cf_root", c) / gcm
     force = ["--force"] if c["overwrite"] else []
+    trackers = [_p("wind_tracker", c), _p("solar_tracker", c)]
+    capacity = ["--wind-capacity-file", str(trackers[0]),
+                "--solar-capacity-file", str(trackers[1])]
+    jitter = ["--capacity-jitter", str(c["capacity_jitter_mw"])]
 
     # compute_cf.py: aggregation-only reads the existing CF files, not the hourly inputs
     cf_inputs = [_p("shapefile", c), _p("wind_tracker", c), _p("solar_tracker", c)]
@@ -119,8 +129,9 @@ def build_commands(c: dict, aggregate_only: bool = False
             "--ssps", *c["ssps"],
             "--train-start", c["train_start"], "--train-end", c["train_end"],
             "--nquantiles", str(c["nquantiles"]),
+            *capacity, *jitter,
             *force,
-        ], [_p("era5_daily_dir", c), _p("cmip_dir", c)]),
+        ], [_p("era5_daily_dir", c), _p("cmip_dir", c), *trackers]),
 
         "diurnal_fit": ([
             py, str(PIPELINE / "downscale_hourly.py"), "fit",
@@ -128,7 +139,8 @@ def build_commands(c: dict, aggregate_only: bool = False
             "--gcm-grid", str(_p("bc_dir", c) / f"tas_{gcm}_historical_bc.nc"),
             "--out-library", str(_p("library", c)),
             "--n-clusters", str(c["n_clusters"]),
-        ], [_p("bc_dir", c) / f"tas_{gcm}_historical_bc.nc"]),
+            *capacity, *jitter,
+        ], [_p("bc_dir", c) / f"tas_{gcm}_historical_bc.nc", *trackers]),
 
         "diurnal_apply": ([
             py, str(PIPELINE / "downscale_hourly.py"), "apply",
@@ -157,8 +169,7 @@ def build_commands(c: dict, aggregate_only: bool = False
             "--wind-method", c["wind_method"],
             "--shear-file", str(_p("shear_file", c)),
             "--buffer-km", str(c["buffer_km"]),
-            "--wind-capacity-file", str(_p("wind_tracker", c)),
-            "--solar-capacity-file", str(_p("solar_tracker", c)),
+            *capacity, *jitter,
             *(["--skip-validation"] if c["skip_validation"] else []),
             *(["--aggregate-only"] if aggregate_only else force),
         ], cf_inputs),
@@ -173,10 +184,8 @@ def build_commands(c: dict, aggregate_only: bool = False
             "--variables", "wCF", "sCF",
             "--region-col", c["region_col"],
             "--buffer-km", str(c["buffer_km"]),
-            "--wind-capacity-file", str(_p("wind_tracker", c)),
-            "--solar-capacity-file", str(_p("solar_tracker", c)),
-        ], [cf_dir / f"wCF_{gcm}_historical_hourly.nc",
-            _p("wind_tracker", c), _p("solar_tracker", c)]),
+            *capacity, *jitter,
+        ], [cf_dir / f"wCF_{gcm}_historical_hourly.nc", *trackers]),
 
         "tas_states": ([
             py, str(PIPELINE / "aggregate_tas_states.py"),

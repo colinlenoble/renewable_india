@@ -7,7 +7,10 @@ at apply time, preserving sub-daily variability (cloud breaks, wind gusts, …).
 Two-phase pipeline
 ------------------
 fit
-    Regrid ERA5 hourly NetCDF files to GCM grid with xesmf bilinear.
+    Re-aggregate ERA5 hourly NetCDF files onto the GCM grid, conservatively,
+    weighted by installed capacity per ERA5 pixel (rsds: solar tracker,
+    sfcWind: wind tracker, tas: area only; small capacity jitter so cells
+    without capacity fall back to the area mean — see capacity.py).
     Fit MiniBatchKMeans on normalised daily (rsds, tas, sfcWind) features.
     Store ALL individual per-day diurnal profiles per grid cell:
         rsds    → fraction of daily mean   (prof_frac)
@@ -48,6 +51,8 @@ python downscale_hourly.py fit \\
     --gcm-grid   /data/proc/cmip6_bc/tas_CanESM5_historical_bc.nc \\
     --out-library /data/proc/era5/diurnal_library_CanESM5.nc \\
     --n-clusters  30 \\
+    --wind-capacity-file  aux_data/Global-Wind-Power-Tracker-February-2026.xlsx \\
+    --solar-capacity-file aux_data/Global-Solar-Power-Tracker-February-2026.xlsx \\
     --env-dir     /path/to/conda/env
 
 # 2 – Apply (per SSP):
@@ -72,6 +77,9 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from sklearn.cluster import MiniBatchKMeans
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from capacity import DEFAULT_JITTER_MW, WeightedConservativeRegridder, tracker_capacity_maps  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -99,15 +107,21 @@ def load_era5_hourly_nc(nc_path: Path) -> xr.Dataset:
     return ds.sortby("lat").sortby("lon")
 
 
-# ── xesmf regridder factory ───────────────────────────────────────────────────
+# ── ERA5 → GCM re-aggregation ─────────────────────────────────────────────────
 
-def make_regridder(source_ds: xr.Dataset, target_ds: xr.Dataset, xe):
-    return xe.Regridder(
-        source_ds, target_ds,
-        method="bilinear",
-        extrap_method="nearest_s2d",
-        reuse_weights=False,
-    )
+HOURLY_VARS = ["rsds", "tas", "sfcWind"]
+# var → technology whose capacity weights its re-aggregation (tas: area only)
+VAR_TECH = {"sfcWind": "wind", "rsds": "solar"}
+
+
+def make_regridder(source_ds: xr.Dataset, target_ds: xr.Dataset, xe,
+                   trackers: dict, jitter_mw: float) -> WeightedConservativeRegridder:
+    cap_maps = tracker_capacity_maps(source_ds, trackers, VAR_TECH)
+    rg = WeightedConservativeRegridder(source_ds, target_ds, xe,
+                                       capacity=cap_maps, jitter_mw=jitter_mw)
+    for v in HOURLY_VARS:
+        log.info("  %s: %s", v, rg.describe(v))
+    return rg
 
 
 # ── Daily aggregation from hourly ─────────────────────────────────────────────
@@ -249,10 +263,14 @@ def cmd_fit(args):
 
         if regridder is None:
             src_grid = ds_h_era5.isel(time=0).drop_vars("time", errors="ignore")
-            regridder = make_regridder(src_grid, gcm_grid_ds, xe)
+            regridder = make_regridder(
+                src_grid, gcm_grid_ds, xe,
+                {"wind": args.wind_capacity_file, "solar": args.solar_capacity_file},
+                args.capacity_jitter,
+            )
             log.info("  Regridder built")
 
-        ds_h_rg = regridder(ds_h_era5)
+        ds_h_rg = regridder(ds_h_era5[HOURLY_VARS])
         ds_h_rg = ds_h_rg.assign_coords(lat=lat_gcm, lon=lon_gcm)
 
         rsds_pixel_max = np.maximum(rsds_pixel_max, ds_h_rg["rsds"].max("time").values)
@@ -332,7 +350,7 @@ def cmd_fit(args):
     for nc_path in nc_files:
         log.info("  Profiles from %s …", Path(nc_path).name)
         ds_h_era5 = load_era5_hourly_nc(Path(nc_path))
-        ds_h_rg   = regridder(ds_h_era5)
+        ds_h_rg   = regridder(ds_h_era5[HOURLY_VARS])
         ds_h_rg   = ds_h_rg.assign_coords(lat=lat_gcm, lon=lon_gcm)
         ds_d_year = hourly_to_daily(ds_h_rg)
 
@@ -425,6 +443,7 @@ def cmd_fit(args):
         "n_clusters":  K,
         "gcm_grid":    str(args.gcm_grid),
         "era5_nc":     str(args.era5_nc),
+        "era5_regridding": "; ".join(f"{v}: {regridder.describe(v)}" for v in HOURLY_VARS),
     }
     Path(args.out_library).parent.mkdir(parents=True, exist_ok=True)
 
@@ -662,6 +681,15 @@ def parse_args():
                      help="Output library NetCDF path")
     fit.add_argument("--n-clusters",  type=int, default=30,
                      help="Number of K-means clusters (default: 30)")
+    fit.add_argument("--wind-capacity-file",  type=Path, default=None,
+                     help="GEM Global Wind Power Tracker .xlsx — weights the ERA5 → GCM "
+                          "re-aggregation of sfcWind (area-weighted if omitted)")
+    fit.add_argument("--solar-capacity-file", type=Path, default=None,
+                     help="GEM Global Solar Power Tracker .xlsx — weights the ERA5 → GCM "
+                          "re-aggregation of rsds (area-weighted if omitted)")
+    fit.add_argument("--capacity-jitter", type=float, default=DEFAULT_JITTER_MW,
+                     help="Capacity floor (MW per ERA5 pixel) so no GCM cell is "
+                          f"capacity-free (default {DEFAULT_JITTER_MW:g})")
     fit.add_argument("--env-dir",     type=Path, default=None,
                      help="Conda env root for ESMFMKFILE (default: sys.prefix)")
 

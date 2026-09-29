@@ -37,7 +37,10 @@ Regional aggregation (identical for wCF and sCF)
 State means are written three ways: area-weighted over the state polygons,
 area-weighted over the polygons buffered by --buffer-km, and weighted by
 operating capacity per pixel from the GEM Global Wind / Solar Power Trackers
-(--wind-capacity-file / --solar-capacity-file).
+(--wind-capacity-file / --solar-capacity-file).  A small capacity jitter
+(--capacity-jitter MW per pixel, scaled by its area inside the state) is added
+to the capacity weights so states without operating capacity fall back to an
+area-weighted mean instead of NaN.
 
 Input conventions
 -----------------
@@ -83,6 +86,7 @@ python compute_cf.py \\
 import argparse
 import glob
 import logging
+import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,6 +104,9 @@ import matplotlib.gridspec as gridspec
 import matplotlib.ticker as mticker
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from capacity import DEFAULT_JITTER_MW, build_capacity_weights, capacity_weighted_mean  # noqa: E402
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -752,97 +759,6 @@ def regional_annual_mean(
     )
 
 
-def build_capacity_weights(
-    tracker_file: Path,
-    grid: xr.Dataset,
-    gdf,
-    region_col: str,
-    country: str = "India",
-    statuses: tuple = ("operating",),
-    max_dist_km: float = 50.0,
-) -> tuple[xr.DataArray, pd.DataFrame]:
-    """
-    Installed capacity (MW) per (region, pixel) from a GEM power tracker —
-    Global Wind Power Tracker (sheets 'Data' + 'Below Threshold') or Global
-    Solar Power Tracker (sheets '20 MW+' + '1-20 MW').  Every sheet with the
-    project columns is read, so the same function serves both.
-
-    Each project with a status in *statuses* is assigned to the region that
-    contains it (or the nearest region within max_dist_km, for coastal /
-    border points that fall just outside the polygons) and to the nearest
-    pixel of *grid*.  Capacities of projects sharing a (region, pixel) are
-    summed.
-
-    Returns
-    -------
-    weights  : DataArray (region, lat, lon) of MW, 0 where no capacity
-    projects : DataFrame of the retained projects with their region / pixel
-    """
-    need = ["Country/Area", "Status", "Capacity (MW)", "Latitude", "Longitude"]
-    sheets = pd.read_excel(tracker_file, sheet_name=None)
-    df = pd.concat(
-        [s.assign(sheet=name) for name, s in sheets.items()
-         if set(need).issubset(s.columns)],
-        ignore_index=True,
-    )
-    df = df[(df["Country/Area"] == country) & df["Status"].isin(statuses)]
-    df = df.dropna(subset=["Latitude", "Longitude", "Capacity (MW)"])
-    pts = gpd.GeoDataFrame(
-        df[["Project Name", "Phase Name", "Capacity (MW)", "Status", "sheet"]],
-        geometry=gpd.points_from_xy(df["Longitude"], df["Latitude"]),
-        crs="EPSG:4326",
-    )
-    aeqd = "+proj=aeqd +lat_0=22 +lon_0=80 +units=m +datum=WGS84"
-    joined = gpd.sjoin_nearest(
-        pts.to_crs(aeqd), gdf[[region_col, "geometry"]].to_crs(aeqd),
-        how="inner", max_distance=max_dist_km * 1000.0,
-    )
-    joined = joined[~joined.index.duplicated()]      # ties on shared borders
-    n_drop = len(pts) - len(joined)
-    if n_drop:
-        log.warning("  %d %s projects farther than %g km from any region — dropped",
-                    n_drop, country, max_dist_km)
-
-    lat = grid["lat"].values
-    lon = grid["lon"].values
-    joined["ilat"] = np.abs(lat[None, :] - pts.loc[joined.index].geometry.y.values[:, None]).argmin(1)
-    joined["ilon"] = np.abs(lon[None, :] - pts.loc[joined.index].geometry.x.values[:, None]).argmin(1)
-
-    regions = gdf[region_col].tolist()
-    w = np.zeros((len(regions), len(lat), len(lon)))
-    ireg = joined[region_col].map({r: i for i, r in enumerate(regions)}).values
-    np.add.at(w, (ireg, joined["ilat"].values, joined["ilon"].values),
-              joined["Capacity (MW)"].values)
-    weights = xr.DataArray(
-        w, dims=("region", "lat", "lon"),
-        coords={"region": regions, "lat": grid["lat"], "lon": grid["lon"]},
-        name="capacity_mw",
-    )
-    log.info("  Capacity weights: %d projects, %.1f GW, %d pixels, %d regions with capacity",
-             len(joined), joined["Capacity (MW)"].sum() / 1e3,
-             int((weights.sum("region") > 0).sum()),
-             int((weights.sum(["lat", "lon"]) > 0).sum()))
-    return weights, pd.DataFrame(joined.drop(columns="geometry"))
-
-
-def capacity_weighted_mean(
-    cf_da: xr.DataArray, weights: xr.DataArray
-) -> xr.DataArray:
-    """
-    Capacity-weighted CF per region, at cf_da's own time step:
-        CF_r(t) = Σ_pixels MW(r, pixel) * CF(pixel, t) / Σ_pixels MW(r, pixel)
-    Only pixels holding capacity are touched (a few hundred), so this is cheap
-    even on hourly data.  Pixels with NaN CF are excluded from both sums;
-    regions with no installed capacity are NaN.  Returns (time, region).
-    """
-    w  = weights.stack(pixel=("lat", "lon"))
-    w  = w.isel(pixel=np.flatnonzero(w.sum("region").values > 0))
-    cf = cf_da.stack(pixel=("lat", "lon")).sel(pixel=w["pixel"])
-    num = xr.dot(cf.fillna(0.0), w, dims="pixel")
-    den = xr.dot(cf.notnull().astype(np.float32), w, dims="pixel")
-    return (num / den.where(den > 0)).transpose("time", "region").astype(np.float32)
-
-
 def regional_annual_mean_capacity(
     cf_da: xr.DataArray, weights: xr.DataArray
 ) -> pd.DataFrame:
@@ -1122,6 +1038,10 @@ def parse_args():
     p.add_argument("--solar-capacity-file", type=Path, default=None,
                    help="GEM Global Solar Power Tracker .xlsx; if given, also "
                         "aggregate sCF weighted by operating capacity per pixel")
+    p.add_argument("--capacity-jitter", type=float, default=DEFAULT_JITTER_MW,
+                   help="Capacity floor (MW per pixel, scaled by its area in the "
+                        "state) added to the capacity weights so no state is "
+                        f"capacity-free (default {DEFAULT_JITTER_MW:g}; 0 disables)")
     p.add_argument("--skip-validation", action="store_true",
                    help="Skip daily BC validation plots (saves time if already produced)")
     p.add_argument("--aggregate-only", action="store_true",
@@ -1213,7 +1133,7 @@ def main():
             continue
         log.info("Building %s capacity weights from %s …", tech, tracker)
         cap_weights[name], projects = build_capacity_weights(
-            tracker, ds_grid, gdf, args.region_col)
+            tracker, ds_grid, gdf, args.region_col, jitter_mw=args.capacity_jitter)
         projects.to_csv(args.out_dir / f"{tech}_capacity_projects_used.csv", index=False)
 
     cfg = CFConfig(

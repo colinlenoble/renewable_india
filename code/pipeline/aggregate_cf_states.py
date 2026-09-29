@@ -7,7 +7,9 @@ conventions as aggregate_tas_states.py.
 Input:  <cf-dir>/<gcm>/{wCF,sCF}_<gcm>_<scenario>_hourly.nc   (compute_cf.py output)
 Output: <out-dir>/<gcm>/{wCF,sCF}_<gcm>_<scenario>_states_hourly.csv  (native hourly)
         + ..._states_buffer{km}km_hourly.csv  (if --buffer-km > 0)
-        + ..._states_capacity_hourly.csv      (if --wind/solar-capacity-file)
+        + ..._states_capacity_hourly.csv      (if --wind/solar-capacity-file;
+          capacity + a small jitter floor, so states without capacity get
+          the area-weighted mean instead of NaN)
         — same three aggregations as the annual means of compute_cf.py.
 
 Loads data eagerly via h5netcdf + numpy (not dask/netCDF4) — both have shown
@@ -50,7 +52,8 @@ import xagg as xa
 
 # Same buffer / capacity-weighting logic as the annual means in compute_cf.py
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from compute_cf import buffer_regions, build_capacity_weights, capacity_weighted_mean
+from compute_cf import buffer_regions
+from capacity import DEFAULT_JITTER_MW, build_capacity_weights, capacity_weighted_mean
 
 logging.basicConfig(
     level=logging.INFO,
@@ -139,6 +142,9 @@ def parse_args():
                     help="GEM Global Wind Power Tracker .xlsx → capacity-weighted wCF")
     p.add_argument("--solar-capacity-file", type=Path, default=None,
                     help="GEM Global Solar Power Tracker .xlsx → capacity-weighted sCF")
+    p.add_argument("--capacity-jitter", type=float, default=DEFAULT_JITTER_MW,
+                    help="Capacity floor (MW per pixel, scaled by its area in the state) "
+                         f"so no state is capacity-free (default {DEFAULT_JITTER_MW:g}; 0 disables)")
     return p.parse_args()
 
 
@@ -177,7 +183,8 @@ def main():
     for var, tracker in [("wCF", args.wind_capacity_file), ("sCF", args.solar_capacity_file)]:
         if tracker is not None and var in args.variables:
             log.info("Building %s capacity weights from %s …", var, tracker)
-            cap_weights[var], _ = build_capacity_weights(tracker, ds_grid, gdf, args.region_col)
+            cap_weights[var], _ = build_capacity_weights(
+                tracker, ds_grid, gdf, args.region_col, jitter_mw=args.capacity_jitter)
 
     for var in args.variables:
         for scn in args.scenarios:
