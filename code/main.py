@@ -7,6 +7,8 @@ Runs, in order, with the configuration below:
     diurnal_fit      pipeline/downscale_hourly.py fit     K-means diurnal library from ERA5 hourly
     diurnal_apply    pipeline/downscale_hourly.py apply   daily BC GCM -> hourly (historical + SSPs)
     cf               pipeline/compute_cf.py               hourly wCF / sCF + annual state means
+    wcf_variants     pipeline/compute_wcf_variants.py     hourly wCF per turbine assumption
+                                                          (conservative / optimistic, see CONFIG)
     cf_states        pipeline/aggregate_cf_states.py      hourly state series of wCF / sCF
     tas_states       pipeline/aggregate_tas_states.py     hourly state series of tas
 
@@ -27,6 +29,7 @@ Usage (from anywhere; paths are resolved from the repository root)
 -----
 python code/main.py                              # all steps
 python code/main.py --steps cf cf_states         # a subset, in pipeline order
+python code/main.py --steps wcf_variants         # only the turbine-assumption wCF files
 python code/main.py --dry-run                    # print the commands only
 python code/main.py --aggregate-only             # redo only the state aggregations
                                                  # from the existing CF / hourly files
@@ -78,13 +81,19 @@ CONFIG = {
     "seed":            42,
     "hub_height":      150,       # m
     "wind_method":     "shear_local",
+    # wcf_variants: name -> hub height (m), rated / cut-in / cut-out speed (m s-1)
+    "wind_variants": {
+        "conservative": {"hub_height": 120, "vr": 13.0, "vci": 3.5, "vco": 25.0},
+        "optimistic":   {"hub_height": 150, "vr": 11.0, "vci": 3.0, "vco": 27.0},
+    },
     "buffer_km":       50,
     "capacity_jitter_mw": 1e-3,   # capacity floor (MW per pixel) in all capacity weightings
     "skip_validation": False,     # daily BC validation plots in compute_cf
     "overwrite":       True,      # recompute outputs that already exist (else skip them)
 }
 
-STEPS = ["bias_correction", "diurnal_fit", "diurnal_apply", "cf", "cf_states", "tas_states"]
+STEPS = ["bias_correction", "diurnal_fit", "diurnal_apply", "cf", "wcf_variants",
+         "cf_states", "tas_states"]
 AGGREGATION_STEPS = ["cf", "cf_states", "tas_states"]   # run with --aggregate-only
 
 logging.basicConfig(
@@ -173,6 +182,20 @@ def build_commands(c: dict, aggregate_only: bool = False
             *(["--skip-validation"] if c["skip_validation"] else []),
             *(["--aggregate-only"] if aggregate_only else force),
         ], cf_inputs),
+
+        "wcf_variants": ([
+            py, str(PIPELINE / "compute_wcf_variants.py"),
+            "--hourly-dir", str(_p("hourly_dir", c)),
+            "--out-dir", str(cf_dir),
+            "--gcm", gcm,
+            "--scenarios", *scenarios,
+            "--wind-method", c["wind_method"],
+            "--shear-file", str(_p("shear_file", c)),
+            *[a for name, v in c["wind_variants"].items()
+              for a in ("--variant", name, *(str(v[k]) for k in ("hub_height", "vr", "vci", "vco")))],
+            *force,
+        ], [_p("hourly_dir", c) / f"{gcm}_{s}_hourly.nc" for s in scenarios]
+           + [_p("shear_file", c)]),
 
         "cf_states": ([
             py, str(PIPELINE / "aggregate_cf_states.py"),
