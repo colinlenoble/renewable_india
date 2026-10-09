@@ -50,9 +50,9 @@ PIPELINE = ROOT / "code" / "pipeline"
 
 CONFIG = {
     # ── Model / scenarios ─────────────────────────────────────────────────────
-    "gcm":         "CanESM5",
-    "run":         "r10i1p1f1",
-    "ssps":        ["ssp245", "ssp585"],
+    "gcm":         "GFDL-ESM4",
+    "run":         "r1i1p1f1",
+    "ssps":        ["ssp126", "ssp245", "ssp370", "ssp585"],
     "train_start": "1980-01-01",
     "train_end":   "2010-12-31",
 
